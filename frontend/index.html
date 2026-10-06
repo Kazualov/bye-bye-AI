@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Inpainting Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+    h1 { margin-bottom: 8px; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 320px; }
+    canvas { border: 1px solid #ccc; cursor: crosshair; max-width: 100%; touch-action: none; }
+    .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 20px; }
+    .card { border: 1px solid #ddd; padding: 8px; border-radius: 8px; background: #fafafa; }
+    .card img { width: 100%; display: block; border-radius: 4px; }
+    .card .title { font-weight: 600; margin-bottom: 4px; }
+    .card .status { font-size: 12px; color: #666; }
+    .failed { color: #b00; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .controls { margin: 12px 0; }
+    .controls label { display: block; margin: 4px 0; }
+    .hint { font-size: 13px; color: #666; margin: 8px 0; }
+  </style>
+</head>
+<body>
+
+<h1>Inpainting Demo</h1>
+<p class="hint">Upload an image, draw a mask with your mouse, pick models, and click Run.</p>
+
+<div class="row">
+  <div class="col">
+    <h3>1. Input + mask</h3>
+    <input type="file" id="file" accept="image/*"/>
+    <div class="controls">
+      <button id="clear" type="button">Clear mask</button>
+    </div>
+    <canvas id="canvas" width="512" height="512"></canvas>
+  </div>
+
+  <div class="col">
+    <h3>2. Models</h3>
+    <div class="controls">
+      <label><input type="checkbox" value="telea" checked/> OpenCV Telea</label>
+      <label><input type="checkbox" value="lama" checked/> LaMa</label>
+      <label><input type="checkbox" value="vit" checked/> ViTInpainter</label>
+      <label><input type="checkbox" value="flux" checked/> FLUX.1-Fill</label>
+    </div>
+    <button id="run" type="button">Run</button>
+    <p class="hint" id="jobStatus"></p>
+  </div>
+</div>
+
+<div class="gallery" id="gallery"></div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let img = null;
+let drawing = false;
+let lastX = 0, lastY = 0;
+
+document.getElementById('file').onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const image = new Image();
+  image.onload = () => {
+    canvas.width = image.width;
+    canvas.height = image.height;
+    ctx.drawImage(image, 0, 0);
+    img = image;
+  };
+  image.src = url;
+};
+
+function pointerPos(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * canvas.width / r.width;
+  const y = (e.clientY - r.top) * canvas.height / r.height;
+  return { x, y };
+}
+
+function drawLine(x0, y0, x1, y1) {
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 30;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (!img) return;
+  drawing = true;
+  const p = pointerPos(e);
+  lastX = p.x; lastY = p.y;
+  drawLine(p.x, p.y, p.x, p.y);
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  const p = pointerPos(e);
+  drawLine(lastX, lastY, p.x, p.y);
+  lastX = p.x; lastY = p.y;
+});
+
+canvas.addEventListener('pointerup', () => drawing = false);
+canvas.addEventListener('pointerleave', () => drawing = false);
+
+document.getElementById('clear').onclick = () => {
+  if (img) ctx.drawImage(img, 0, 0);
+};
+
+function toBlob(canvasEl) {
+  return new Promise((resolve) => canvasEl.toBlob(resolve, 'image/png'));
+}
+
+function makeMaskBlob() {
+  const m = document.createElement('canvas');
+  m.width = canvas.width;
+  m.height = canvas.height;
+  const mx = m.getContext('2d');
+
+  const src = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const dst = mx.createImageData(m.width, m.height);
+
+  for (let i = 0; i < src.data.length; i += 4) {
+    const isWhite =
+      src.data[i] > 200 && src.data[i + 1] > 200 && src.data[i + 2] > 200;
+    const v = isWhite ? 255 : 0;
+    dst.data[i] = v;
+    dst.data[i + 1] = v;
+    dst.data[i + 2] = v;
+    dst.data[i + 3] = 255;
+  }
+  mx.putImageData(dst, 0, 0);
+  return new Promise((resolve) => m.toBlob(resolve, 'image/png'));
+}
+
+document.getElementById('run').onclick = async () => {
+  const runBtn = document.getElementById('run');
+  const statusEl = document.getElementById('jobStatus');
+
+  if (!img) { alert('Upload an image first'); return; }
+
+  const selected = [...document.querySelectorAll('input[type=checkbox]:checked')]
+    .map((c) => c.value);
+  if (!selected.length) { alert('Pick at least one model'); return; }
+
+  const imageBlob = await toBlob(canvas);
+  const maskBlob = await makeMaskBlob();
+
+  const fd = new FormData();
+  fd.append('image', imageBlob, 'input.png');
+  fd.append('mask', maskBlob, 'mask.png');
+  fd.append('models', selected.join(','));
+
+  runBtn.disabled = true;
+  statusEl.textContent = 'Submitting...';
+
+  try {
+    const r = await fetch('/api/v1/jobs', { method: 'POST', body: fd });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      statusEl.textContent = 'Error: ' + (err.message || r.status);
+      runBtn.disabled = false;
+      return;
+    }
+    const { job_id } = await r.json();
+    pollJob(job_id, runBtn, statusEl);
+  } catch (e) {
+    statusEl.textContent = 'Network error: ' + e.message;
+    runBtn.disabled = false;
+  }
+};
+
+async function pollJob(jobId, runBtn, statusEl) {
+  const gallery = document.getElementById('gallery');
+  const tick = async () => {
+    const r = await fetch('/api/v1/jobs/' + jobId);
+    const job = await r.json();
+
+    statusEl.textContent = `job ${job.job_id} — ${job.status}`;
+    gallery.innerHTML = '';
+
+    for (const res of job.results) {
+      const card = document.createElement('div');
+      card.className = 'card';
+
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.textContent = res.model;
+
+      const status = document.createElement('div');
+      status.className = 'status';
+      status.textContent = res.status
+        + (res.runtime_ms ? ` · ${res.runtime_ms} ms` : '')
+        + (res.error ? ` · ${res.error}` : '');
+      if (res.error) status.classList.add('failed');
+
+      card.appendChild(title);
+      card.appendChild(status);
+
+      if (res.output_url) {
+        const im = document.createElement('img');
+        im.src = res.output_url;
+        card.appendChild(im);
+      }
+
+      gallery.appendChild(card);
+    }
+
+    if (job.status === 'pending' || job.status === 'running') {
+      setTimeout(tick, 1500);
+    } else {
+      runBtn.disabled = false;
+    }
+  };
+  tick();
+}
+</script>
+
+</body>
+</html>

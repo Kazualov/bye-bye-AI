@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+storage/
+test_image.png
+test_mask.png
+test_artifacts/
+.idea/
+.vscode/
+.DS_Store
