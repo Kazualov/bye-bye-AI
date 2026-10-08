@@ -1,0 +1,31 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+numpy>=1.26
+Pillow>=10.0
+opencv-python>=4.9
+huggingface_hub>=0.23           # downloads big-lama.pt on first run (~200 MB) and dataset
+
+# ── LaMa ──────────────────────────────────────────────────────────────────────
+torch>=2.2                      # also required by LaMa and LPIPS
+torchvision>=0.17
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+scikit-image>=0.22              # SSIM
+lpips>=0.1.4                    # perceptual similarity
+
+# ── Evaluation pipeline ───────────────────────────────────────────────────────
+pandas>=2.1
+matplotlib>=3.8
+tqdm>=4.66
+
+# ── Backend API (Tatiana) ─────────────────────────────────────────────────────
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9         # for file uploads
+
+# ── ViTInpainter (Alexander) — add packages here after spike ──────────────────
+
+# ── FLUX.1-Fill (Egor) — add packages here after spike ────────────────────────
+# diffusers>=0.27
+# transformers>=4.40
+# accelerate>=0.29
+# sentencepiece
