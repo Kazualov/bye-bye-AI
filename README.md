@@ -49,13 +49,19 @@ LaMa weights are downloaded automatically on first use.
 
 ## Evaluation Mode
 
-Runs the full benchmark against the CORNE-Val dataset and writes
-`results/metrics.csv`, `results/summary.csv`, plots, and comparison grids.
+Runs the benchmark against the CORNE-Val dataset and writes per-model
+subdirectories under the output folder, each containing `metrics.csv`,
+`summary.csv`, comparison grids, and plots.
 
 ```bash
+# All models
 python -m evaluation.benchmark \
     --dataset data/corne-val \
     --output  results/
+
+# Specific model(s)
+python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa
+python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa "OpenCV Telea"
 ```
 
 ### CORNE-Val directory layout
