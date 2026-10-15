@@ -105,7 +105,8 @@ def build_models() -> dict:
     models["OpenCV Telea"] = OpenCVTelea()
 
     try:
-        models["LaMa"] = LaMaInpainter()
+        #models["LaMa"] = LaMaInpainter()
+        pass
     except Exception as e:
         print(f"  [skip] LaMa could not be loaded: {e}")
 
