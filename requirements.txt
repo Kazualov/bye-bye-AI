@@ -29,3 +29,12 @@ python-multipart>=0.0.9         # for file uploads
 # transformers>=4.40
 # accelerate>=0.29
 # sentencepiece
+
+
+# ── FLUX.1-Fill (Egor) ────────────────────────────────────────────────────────
+diffusers>=0.31.0
+transformers>=4.44.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
