@@ -14,34 +14,20 @@ from .base import BaseInpainter, InpaintResult
 class FluxFillInpainter(BaseInpainter):
     """
     Diffusion-based inpainting model using FLUX.1-Fill-dev,
-    tuned specifically for object removal and background reconstruction.
+    configured for clean object removal without object regeneration.
     """
 
     def __init__(
         self,
         model_id: str = "black-forest-labs/FLUX.1-Fill-dev",
         num_inference_steps: int = 24,
-        guidance_scale: float = 15.0,
+        guidance_scale: float = 7.0,
         max_side: int = 768,
-        prompt: str = (
-            "empty background, nothing here, seamless background continuation, "
-            "natural surface texture, clean scene without foreground object"
-        ),
+        prompt: str = "",
         seed: int = 42,
         quantize: bool = True,
-        mask_expand_px: int = 8,
+        mask_expand_px: int = 20,
     ):
-        """
-        Args:
-            model_id:            Hugging Face repo ID for FLUX.1-Fill.
-            num_inference_steps: Denoising steps (20-28 balances speed and quality).
-            guidance_scale:      Lower values (10-20) reduce object hallucinations.
-            max_side:            Max image side during inference (multiple of 16).
-            prompt:              Fixed prompt instructing background continuation.
-            seed:                Random seed for reproducibility.
-            quantize:            Use 4-bit NF4 quantization for 16 GB VRAM GPUs.
-            mask_expand_px:      Slightly dilate input mask so object edges don't leak.
-        """
         from diffusers import FluxFillPipeline, FluxTransformer2DModel
         from transformers import T5EncoderModel
 
@@ -55,10 +41,8 @@ class FluxFillInpainter(BaseInpainter):
         self.mask_expand_px = mask_expand_px
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        if self.device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
-            self.dtype = torch.float16
-        else:
-            self.dtype = torch.bfloat16
+        # ВАЖНО: FLUX.1-Fill обучен строго в bfloat16 (в float16 дает артефакты и кашу)
+        self.dtype = torch.bfloat16
 
         if self.device == "cuda" and self.quantize:
             from diffusers import BitsAndBytesConfig as DiffusersBnBConfig
@@ -128,17 +112,29 @@ class FluxFillInpainter(BaseInpainter):
                 metadata={"skipped": True},
             )
 
-        # Expand mask slightly so residual object boundary pixels don't trigger re-generation
+        # 1. Расширяем маску, чтобы захватить рефлексы, контуры и тени на границе объекта
         if self.mask_expand_px > 0:
             k = 2 * self.mask_expand_px + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            feed_mask = cv2.dilate(binary_mask, kernel, iterations=1) * 255
+            dilated_mask = cv2.dilate(binary_mask, kernel, iterations=1)
         else:
-            feed_mask = binary_mask * 255
+            dilated_mask = binary_mask
+
+        feed_mask = dilated_mask * 255
+
+        # 2. Предварительно затираем пиксели объекта внутри маски (Telea pre-fill),
+        # чтобы при кодировании через VAE цвета объекта не протекали в латенты на границе
+        clean_init_bgr = cv2.inpaint(
+            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+            feed_mask,
+            inpaintRadius=5,
+            flags=cv2.INPAINT_TELEA,
+        )
+        clean_init_rgb = cv2.cvtColor(clean_init_bgr, cv2.COLOR_BGR2RGB)
 
         target_w, target_h = self._compute_target_size(orig_w, orig_h, self.max_side)
 
-        pil_image = Image.fromarray(image).convert("RGB")
+        pil_image = Image.fromarray(clean_init_rgb).convert("RGB")
         pil_mask = Image.fromarray(feed_mask).convert("L")
 
         if (target_w, target_h) != (orig_w, orig_h):
@@ -178,9 +174,9 @@ class FluxFillInpainter(BaseInpainter):
 
         pred_rgb = np.array(out_pil, dtype=np.uint8)
 
-        # Composite inside the feed_mask so dilated object borders are also replaced cleanly
-        comp_mask = (feed_mask > 0)[..., None]
-        final_rgb = np.where(comp_mask, pred_rgb, image).astype(np.uint8)
+        # 3. Мягкая сшивка (feathering) по краю расширенной маски без резкого шва
+        alpha = cv2.GaussianBlur(feed_mask.astype(np.float32) / 255.0, (11, 11), 0)[..., None]
+        final_rgb = np.clip(pred_rgb * alpha + image * (1.0 - alpha), 0, 255).astype(np.uint8)
 
         metadata = {
             "num_inference_steps": self.num_inference_steps,
