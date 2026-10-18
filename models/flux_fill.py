@@ -1,8 +1,9 @@
 """
-FLUX.1-Fill — Diffusion-based inpainting model.
+FLUX.1-Fill — Diffusion-based inpainting and object removal model.
 """
 
 import time
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -12,29 +13,34 @@ from .base import BaseInpainter, InpaintResult
 
 class FluxFillInpainter(BaseInpainter):
     """
-    Diffusion-based inpainting model using FLUX.1-Fill-dev.
-    Supports 4-bit NF4 quantization (via bitsandbytes) to fit into 16 GB VRAM GPUs (e.g. Kaggle T4).
+    Diffusion-based inpainting model using FLUX.1-Fill-dev,
+    tuned specifically for object removal and background reconstruction.
     """
 
     def __init__(
         self,
         model_id: str = "black-forest-labs/FLUX.1-Fill-dev",
-        num_inference_steps: int = 28,
-        guidance_scale: float = 30.0,
+        num_inference_steps: int = 24,
+        guidance_scale: float = 15.0,
         max_side: int = 768,
-        prompt: str = "clean background, seamless continuation, high quality, natural texture",
+        prompt: str = (
+            "empty background, nothing here, seamless background continuation, "
+            "natural surface texture, clean scene without foreground object"
+        ),
         seed: int = 42,
         quantize: bool = True,
+        mask_expand_px: int = 8,
     ):
         """
         Args:
             model_id:            Hugging Face repo ID for FLUX.1-Fill.
-            num_inference_steps: Denoising steps (20-28 is a good speed/quality sweet spot).
-            guidance_scale:      Guidance scale (30.0 is recommended for FLUX.1-Fill).
-            max_side:            Maximum resolution side (multiple of 16) to avoid OOM.
-            prompt:              Fixed minimal prompt for generic object removal / inpainting.
+            num_inference_steps: Denoising steps (20-28 balances speed and quality).
+            guidance_scale:      Lower values (10-20) reduce object hallucinations.
+            max_side:            Max image side during inference (multiple of 16).
+            prompt:              Fixed prompt instructing background continuation.
             seed:                Random seed for reproducibility.
-            quantize:            Use 4-bit NF4 quantization if CUDA + bitsandbytes are available.
+            quantize:            Use 4-bit NF4 quantization for 16 GB VRAM GPUs.
+            mask_expand_px:      Slightly dilate input mask so object edges don't leak.
         """
         from diffusers import FluxFillPipeline, FluxTransformer2DModel
         from transformers import T5EncoderModel
@@ -46,9 +52,9 @@ class FluxFillInpainter(BaseInpainter):
         self.prompt = prompt
         self.seed = seed
         self.quantize = quantize
+        self.mask_expand_px = mask_expand_px
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # T4 (compute capability 7.5) works best with float16 compute; Ampere+ (8.0+) prefers bfloat16
         if self.device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
             self.dtype = torch.float16
         else:
@@ -94,7 +100,6 @@ class FluxFillInpainter(BaseInpainter):
                 torch_dtype=self.dtype,
             )
 
-        # Memory optimizations
         if self.device == "cuda":
             self.pipe.enable_model_cpu_offload()
         self.pipe.vae.enable_slicing()
@@ -107,29 +112,15 @@ class FluxFillInpainter(BaseInpainter):
 
     @staticmethod
     def _compute_target_size(orig_w: int, orig_h: int, max_side: int) -> tuple[int, int]:
-        """Scale down if needed and align width/height to multiples of 16."""
         scale = min(1.0, max_side / max(orig_w, orig_h))
         new_w = max(16, int(round((orig_w * scale) / 16.0)) * 16)
         new_h = max(16, int(round((orig_h * scale) / 16.0)) * 16)
         return new_w, new_h
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> InpaintResult:
-        """
-        Fill the masked region of `image`.
-
-        Args:
-            image: RGB image, dtype uint8, shape (H, W, 3).
-            mask:  Binary mask, dtype uint8, shape (H, W). Pixels > 0 are inpainted.
-
-        Returns:
-            InpaintResult containing the reconstructed RGB image, timing, and VRAM metadata.
-        """
         orig_h, orig_w = image.shape[:2]
+        binary_mask = (mask > 0).astype(np.uint8)
 
-        # Binary mask in {0, 255}
-        binary_mask = ((mask > 0).astype(np.uint8)) * 255
-
-        # Fast-path if mask is completely empty
         if not np.any(binary_mask):
             return InpaintResult(
                 image=image.copy(),
@@ -137,10 +128,18 @@ class FluxFillInpainter(BaseInpainter):
                 metadata={"skipped": True},
             )
 
+        # Expand mask slightly so residual object boundary pixels don't trigger re-generation
+        if self.mask_expand_px > 0:
+            k = 2 * self.mask_expand_px + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            feed_mask = cv2.dilate(binary_mask, kernel, iterations=1) * 255
+        else:
+            feed_mask = binary_mask * 255
+
         target_w, target_h = self._compute_target_size(orig_w, orig_h, self.max_side)
 
         pil_image = Image.fromarray(image).convert("RGB")
-        pil_mask = Image.fromarray(binary_mask).convert("L")
+        pil_mask = Image.fromarray(feed_mask).convert("L")
 
         if (target_w, target_h) != (orig_w, orig_h):
             pil_image_in = pil_image.resize((target_w, target_h), Image.Resampling.BICUBIC)
@@ -174,21 +173,21 @@ class FluxFillInpainter(BaseInpainter):
 
         inference_time = time.perf_counter() - t0
 
-        # Resize back to original dimensions
         if out_pil.size != (orig_w, orig_h):
             out_pil = out_pil.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
 
         pred_rgb = np.array(out_pil, dtype=np.uint8)
 
-        # Composite: keep original unmasked pixels untouched for accurate full-image metrics
-        mask_bool = (mask > 0)[..., None]
-        final_rgb = np.where(mask_bool, pred_rgb, image).astype(np.uint8)
+        # Composite inside the feed_mask so dilated object borders are also replaced cleanly
+        comp_mask = (feed_mask > 0)[..., None]
+        final_rgb = np.where(comp_mask, pred_rgb, image).astype(np.uint8)
 
         metadata = {
             "num_inference_steps": self.num_inference_steps,
             "guidance_scale": self.guidance_scale,
             "inference_resolution": f"{target_w}x{target_h}",
             "quantized_4bit": self.quantize,
+            "mask_expand_px": self.mask_expand_px,
         }
         if self.device == "cuda":
             metadata["vram_allocated_mb"] = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 2)
