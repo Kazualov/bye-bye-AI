@@ -9,30 +9,35 @@ Weights are cached by huggingface_hub on first use (~200 MB).
 """
 
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+from torch.hub import download_url_to_file
 
 from .base import BaseInpainter, InpaintResult
 
-_HF_REPO = "smartywu/big-lama"
-_HF_FILE = "big-lama.pt"
+# TorchScript export of big-lama (hosted by the IOPaint project)
+_WEIGHTS_URL = (
+    "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
+)
+_WEIGHTS_PATH = Path.home() / ".cache" / "inpainting-bench" / "big-lama.pt"
+
+
+def _ensure_weights() -> Path:
+    if not _WEIGHTS_PATH.exists():
+        _WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _WEIGHTS_PATH.with_suffix(".part")
+        download_url_to_file(_WEIGHTS_URL, str(tmp))
+        tmp.rename(_WEIGHTS_PATH)  # only appears once fully downloaded
+    return _WEIGHTS_PATH
 
 
 class LaMaInpainter(BaseInpainter):
-    """
-    LaMa inpainter using the big-lama TorchScript model.
-
-    The model is loaded once at construction and reused for every
-    `inpaint` call. Uses MPS on Apple Silicon, CUDA if available,
-    otherwise CPU.
-    """
-
     def __init__(self):
-        weights_path = hf_hub_download(repo_id=_HF_REPO, filename=_HF_FILE)
+        weights_path = _ensure_weights()
         self._device = self._pick_device()
-        self._model = torch.jit.load(weights_path, map_location=self._device)
+        self._model = torch.jit.load(str(weights_path), map_location=self._device)
         self._model.eval()
 
     @staticmethod
