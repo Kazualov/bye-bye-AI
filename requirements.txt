@@ -1,3 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+numpy
 # ── Core ──────────────────────────────────────────────────────────────────────
 numpy>=1.26
 Pillow>=10.0
