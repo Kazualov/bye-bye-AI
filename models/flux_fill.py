@@ -13,20 +13,23 @@ from .base import BaseInpainter, InpaintResult
 
 class FluxFillInpainter(BaseInpainter):
     """
-    Diffusion-based inpainting model using FLUX.1-Fill-dev,
-    configured for clean object removal without object regeneration.
+    Diffusion-based inpainting model using FLUX.1-Fill-dev.
+
+    Pre/post-processing follows ViTInpainter: no mask dilation by default,
+    original pixels outside the mask, inward-only feathering.
     """
 
     def __init__(
         self,
         model_id: str = "black-forest-labs/FLUX.1-Fill-dev",
-        num_inference_steps: int = 24,
-        guidance_scale: float = 7.0,
+        num_inference_steps: int = 28,
+        guidance_scale: float = 30.0,
         max_side: int = 768,
         prompt: str = "",
         seed: int = 42,
         quantize: bool = True,
-        mask_expand_px: int = 20,
+        mask_expand_px: int = 0,
+        feather_radius: float = 3.0,
     ):
         from diffusers import FluxFillPipeline, FluxTransformer2DModel
         from transformers import T5EncoderModel
@@ -39,6 +42,7 @@ class FluxFillInpainter(BaseInpainter):
         self.seed = seed
         self.quantize = quantize
         self.mask_expand_px = mask_expand_px
+        self.feather_radius = feather_radius
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # ВАЖНО: FLUX.1-Fill обучен строго в bfloat16 (в float16 дает артефакты и кашу)
@@ -112,37 +116,31 @@ class FluxFillInpainter(BaseInpainter):
                 metadata={"skipped": True},
             )
 
-        # 1. Расширяем маску, чтобы захватить рефлексы, контуры и тени на границе объекта
+        # 1. Опциональное расширение маски (по умолчанию выключено, как в ViTInpainter:
+        # бенчмарк сам проверяет dilated-маски, а лишнее расширение портит метрики)
         if self.mask_expand_px > 0:
             k = 2 * self.mask_expand_px + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            dilated_mask = cv2.dilate(binary_mask, kernel, iterations=1)
+            working_mask = cv2.dilate(binary_mask, kernel, iterations=1)
         else:
-            dilated_mask = binary_mask
+            working_mask = binary_mask
 
-        feed_mask = dilated_mask * 255
+        feed_mask = working_mask * 255
 
-        # 2. Предварительно затираем пиксели объекта внутри маски (Telea pre-fill),
-        # чтобы при кодировании через VAE цвета объекта не протекали в латенты на границе
-        clean_init_bgr = cv2.inpaint(
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
-            feed_mask,
-            inpaintRadius=5,
-            flags=cv2.INPAINT_TELEA,
-        )
-        clean_init_rgb = cv2.cvtColor(clean_init_bgr, cv2.COLOR_BGR2RGB)
-
+        # 2. Подаём оригинальное изображение без pre-fill: FluxFillPipeline сам
+        # обнуляет пиксели под маской (masked_image = image * (1 - mask))
         target_w, target_h = self._compute_target_size(orig_w, orig_h, self.max_side)
 
-        pil_image = Image.fromarray(clean_init_rgb).convert("RGB")
-        pil_mask = Image.fromarray(feed_mask).convert("L")
+        pil_image_in = Image.fromarray(image).convert("RGB")
+        pil_mask_in = Image.fromarray(feed_mask).convert("L")
 
         if (target_w, target_h) != (orig_w, orig_h):
-            pil_image_in = pil_image.resize((target_w, target_h), Image.Resampling.BICUBIC)
-            pil_mask_in = pil_mask.resize((target_w, target_h), Image.Resampling.NEAREST)
-        else:
-            pil_image_in = pil_image
-            pil_mask_in = pil_mask
+            pil_image_in = pil_image_in.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            # Консервативное уменьшение, чтобы тонкие края маски не съедались
+            pil_mask_in = pil_mask_in.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            pil_mask_in = Image.fromarray(
+                ((np.array(pil_mask_in) > 10).astype(np.uint8) * 255)
+            )
 
         generator = torch.Generator(device="cpu").manual_seed(self.seed)
 
@@ -170,13 +168,20 @@ class FluxFillInpainter(BaseInpainter):
         inference_time = time.perf_counter() - t0
 
         if out_pil.size != (orig_w, orig_h):
-            out_pil = out_pil.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
+            out_pil = out_pil.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
 
         pred_rgb = np.array(out_pil, dtype=np.uint8)
 
-        # 3. Мягкая сшивка (feathering) по краю расширенной маски без резкого шва
-        alpha = cv2.GaussianBlur(feed_mask.astype(np.float32) / 255.0, (11, 11), 0)[..., None]
-        final_rgb = np.clip(pred_rgb * alpha + image * (1.0 - alpha), 0, 255).astype(np.uint8)
+        # 3. Сшивка как в ViTInpainter: снаружи маски пиксели строго оригинальные,
+        # плавный переход только внутри маски на feather_radius пикселей
+        if self.feather_radius > 0:
+            dist = cv2.distanceTransform(working_mask, cv2.DIST_L2, 3)
+            alpha = np.clip(dist / float(self.feather_radius), 0.0, 1.0)[..., None]
+        else:
+            alpha = working_mask[..., None].astype(np.float32)
+        final_rgb = (
+            image.astype(np.float32) * (1.0 - alpha) + pred_rgb.astype(np.float32) * alpha
+        ).round().astype(np.uint8)
 
         metadata = {
             "num_inference_steps": self.num_inference_steps,
@@ -184,6 +189,7 @@ class FluxFillInpainter(BaseInpainter):
             "inference_resolution": f"{target_w}x{target_h}",
             "quantized_4bit": self.quantize,
             "mask_expand_px": self.mask_expand_px,
+            "feather_radius": self.feather_radius,
         }
         if self.device == "cuda":
             metadata["vram_allocated_mb"] = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 2)
