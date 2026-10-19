@@ -17,9 +17,24 @@ _lpips_model = None
 
 
 def _get_lpips():
-    """Load the LPIPS VGG model once and cache it."""
+    """Load the LPIPS VGG model once and cache it.
+
+    On macOS the system Python SSL store often cannot verify pytorch.org's
+    download servers, causing a certificate verification error the first time
+    VGG16 weights are downloaded.  Patching ssl to use certifi's CA bundle
+    fixes this without requiring environment-variable setup.
+    """
     global _lpips_model
     if _lpips_model is None:
+        import ssl
+        try:
+            import certifi
+            ssl._create_default_https_context = (
+                lambda: ssl.create_default_context(cafile=certifi.where())
+            )
+        except ImportError:
+            pass  # certifi not available; rely on system certs
+
         import lpips
         _lpips_model = lpips.LPIPS(net="vgg")
     return _lpips_model
