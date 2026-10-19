@@ -227,3 +227,6 @@ test_artifacts/
 .idea/
 .vscode/
 .DS_Store
+# Project outputs
+results/
+data/corne-val/
