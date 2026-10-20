@@ -1,14 +1,35 @@
 """
 FLUX.1-Fill — Diffusion-based inpainting and object removal model.
+
+Memory layout tuned for consumer GPUs (8 GB VRAM / 16 GB RAM):
+  - transformer: pre-quantized GGUF checkpoint (Q6_K by default, ~9.9 GB,
+    visually almost lossless). Loaded directly, so the 24 GB bf16 weights
+    never have to fit into RAM (bitsandbytes nf4 quantizes on load and needs them).
+  - text encoders: the prompt is fixed, so its embeddings are computed once
+    on CPU, cached to disk and T5/CLIP are never kept in memory (lossless).
+  - if the transformer does not fit into VRAM, it is streamed block by block
+    (group offloading) instead of being moved to the GPU as a whole.
+
+Env overrides (handy for Kaggle / CLI benchmark):
+    FLUX_GGUF=Q4_K_S|Q5_K_S|Q6_K|Q8_0|none   (none = original bf16 weights)
+    FLUX_OFFLOAD=auto|model|group
 """
 
+import gc
+import hashlib
+import os
 import time
+from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 
 from .base import BaseInpainter, InpaintResult
+
+_GGUF_REPO = "YarvixPA/FLUX.1-Fill-dev-GGUF"
+_CACHE_DIR = Path.home() / ".cache" / "inpainting-bench"
 
 
 class FluxFillInpainter(BaseInpainter):
@@ -27,12 +48,17 @@ class FluxFillInpainter(BaseInpainter):
         max_side: int = 768,
         prompt: str = "",
         seed: int = 42,
-        quantize: bool = True,
+        gguf_quant: str | None = "Q6_K",
+        offload: str = "auto",
         mask_expand_px: int = 0,
         feather_radius: float = 3.0,
     ):
-        from diffusers import FluxFillPipeline, FluxTransformer2DModel
-        from transformers import T5EncoderModel
+        from diffusers import FluxFillPipeline
+
+        gguf_quant = os.environ.get("FLUX_GGUF", gguf_quant)
+        if gguf_quant is not None and gguf_quant.lower() == "none":
+            gguf_quant = None
+        offload = os.environ.get("FLUX_OFFLOAD", offload)
 
         self.model_id = model_id
         self.num_inference_steps = num_inference_steps
@@ -40,7 +66,7 @@ class FluxFillInpainter(BaseInpainter):
         self.max_side = max_side
         self.prompt = prompt
         self.seed = seed
-        self.quantize = quantize
+        self.gguf_quant = gguf_quant
         self.mask_expand_px = mask_expand_px
         self.feather_radius = feather_radius
 
@@ -48,51 +74,113 @@ class FluxFillInpainter(BaseInpainter):
         # ВАЖНО: FLUX.1-Fill обучен строго в bfloat16 (в float16 дает артефакты и кашу)
         self.dtype = torch.bfloat16
 
-        if self.device == "cuda" and self.quantize:
-            from diffusers import BitsAndBytesConfig as DiffusersBnBConfig
-            from transformers import BitsAndBytesConfig as TransformersBnBConfig
+        # 1. Эмбеддинги промпта — до загрузки трансформера, чтобы T5 и FLUX
+        # не лежали в RAM одновременно
+        self.prompt_embeds, self.pooled_prompt_embeds = self._load_prompt_embeds()
 
-            nf4_diffusers = DiffusersBnBConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=self.dtype,
-            )
-            nf4_transformers = TransformersBnBConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=self.dtype,
-            )
+        # 2. Трансформер
+        transformer = self._load_transformer()
 
-            transformer = FluxTransformer2DModel.from_pretrained(
-                self.model_id,
-                subfolder="transformer",
-                quantization_config=nf4_diffusers,
-                torch_dtype=self.dtype,
-            )
-            text_encoder_2 = T5EncoderModel.from_pretrained(
-                self.model_id,
-                subfolder="text_encoder_2",
-                quantization_config=nf4_transformers,
-                torch_dtype=self.dtype,
-            )
+        # 3. Пайплайн без текстовых энкодеров (только VAE + трансформер)
+        self.pipe = FluxFillPipeline.from_pretrained(
+            self.model_id,
+            transformer=transformer,
+            text_encoder=None,
+            text_encoder_2=None,
+            tokenizer=None,
+            tokenizer_2=None,
+            torch_dtype=self.dtype,
+        )
 
-            self.pipe = FluxFillPipeline.from_pretrained(
-                self.model_id,
-                transformer=transformer,
-                text_encoder_2=text_encoder_2,
-                torch_dtype=self.dtype,
-            )
-        else:
-            self.pipe = FluxFillPipeline.from_pretrained(
-                self.model_id,
-                torch_dtype=self.dtype,
-            )
-
-        if self.device == "cuda":
-            self.pipe.enable_model_cpu_offload()
+        self.offload = self._setup_offload(offload) if self.device == "cuda" else "none"
         self.pipe.vae.enable_slicing()
         self.pipe.vae.enable_tiling()
         self.pipe.set_progress_bar_config(disable=True)
+
+    # ── loading helpers ────────────────────────────────────────────────────────
+
+    def _load_prompt_embeds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the fixed prompt once on CPU and cache it to disk."""
+        key = hashlib.sha1(f"{self.model_id}|{self.prompt}|256".encode()).hexdigest()[:12]
+        cache_path = _CACHE_DIR / f"flux_prompt_{key}.pt"
+        if cache_path.exists():
+            cached = torch.load(cache_path)
+            return cached["prompt_embeds"], cached["pooled_prompt_embeds"]
+
+        from diffusers import FluxFillPipeline
+
+        print(f"  [FLUX] encoding prompt {self.prompt!r} with T5/CLIP on CPU (one-time) ...")
+        text_pipe = FluxFillPipeline.from_pretrained(
+            self.model_id,
+            transformer=None,
+            vae=None,
+            torch_dtype=self.dtype,
+        )
+        with torch.no_grad():
+            prompt_embeds, pooled_prompt_embeds, _ = text_pipe.encode_prompt(
+                prompt=self.prompt,
+                prompt_2=None,
+                device=torch.device("cpu"),
+                max_sequence_length=256,
+            )
+        del text_pipe
+        gc.collect()
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds},
+            cache_path,
+        )
+        return prompt_embeds, pooled_prompt_embeds
+
+    def _load_transformer(self):
+        from diffusers import FluxTransformer2DModel
+
+        if self.gguf_quant is None:
+            return FluxTransformer2DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=self.dtype
+            )
+
+        from diffusers import GGUFQuantizationConfig
+
+        url = (
+            f"https://huggingface.co/{_GGUF_REPO}/blob/main/"
+            f"flux1-fill-dev-{self.gguf_quant}.gguf"
+        )
+        print(f"  [FLUX] loading transformer {self.gguf_quant} from {_GGUF_REPO} ...")
+        return FluxTransformer2DModel.from_single_file(
+            url,
+            quantization_config=GGUFQuantizationConfig(compute_dtype=self.dtype),
+            config=self.model_id,
+            subfolder="transformer",
+            torch_dtype=self.dtype,
+        )
+
+    def _setup_offload(self, offload: str) -> str:
+        if offload == "auto":
+            weights_bytes = sum(
+                p.numel() * p.element_size() for p in self.pipe.transformer.parameters()
+            )
+            total_vram = torch.cuda.get_device_properties(0).total_memory
+            # ~2 GB запаса под активации 768px, VAE и CUDA-контекст
+            offload = "model" if weights_bytes + 2 * 1024 ** 3 < total_vram else "group"
+
+        if offload == "group":
+            # Трансформер живёт в RAM и подгружается на GPU поблочно,
+            # копирование следующего блока идёт параллельно с вычислением текущего
+            self.pipe.transformer.enable_group_offload(
+                onload_device=torch.device("cuda"),
+                offload_device=torch.device("cpu"),
+                offload_type="block_level",
+                num_blocks_per_group=1,
+                use_stream=True,
+                low_cpu_mem_usage=True,
+            )
+            self.pipe.vae.to("cuda")
+        else:
+            self.pipe.enable_model_cpu_offload()
+        print(f"  [FLUX] offload mode: {offload}")
+        return offload
 
     @property
     def name(self) -> str:
@@ -151,14 +239,14 @@ class FluxFillInpainter(BaseInpainter):
         t0 = time.perf_counter()
 
         out_pil = self.pipe(
-            prompt=self.prompt,
+            prompt_embeds=self.prompt_embeds.to(self.device),
+            pooled_prompt_embeds=self.pooled_prompt_embeds.to(self.device),
             image=pil_image_in,
             mask_image=pil_mask_in,
             height=target_h,
             width=target_w,
             num_inference_steps=self.num_inference_steps,
             guidance_scale=self.guidance_scale,
-            max_sequence_length=256,
             generator=generator,
         ).images[0]
 
@@ -187,7 +275,8 @@ class FluxFillInpainter(BaseInpainter):
             "num_inference_steps": self.num_inference_steps,
             "guidance_scale": self.guidance_scale,
             "inference_resolution": f"{target_w}x{target_h}",
-            "quantized_4bit": self.quantize,
+            "transformer_weights": self.gguf_quant or "bf16",
+            "offload": self.offload,
             "mask_expand_px": self.mask_expand_px,
             "feather_radius": self.feather_radius,
         }
