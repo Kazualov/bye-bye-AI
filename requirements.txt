@@ -1,3 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+numpy
 # ── Core ──────────────────────────────────────────────────────────────────────
 numpy>=1.26
 Pillow>=10.0
@@ -23,13 +28,9 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9         # for file uploads
 
 # ── ViTInpainter (Alexander) — add packages here after spike ──────────────────
-
-# ── FLUX.1-Fill (Egor) — add packages here after spike ────────────────────────
-# diffusers>=0.27
-# transformers>=4.40
-# accelerate>=0.29
-# sentencepiece
-
+safetensors>=0.4.3
+timm>=0.9.0
+requests>=2.31.0
 
 # ── FLUX.1-Fill (Egor) ────────────────────────────────────────────────────────
 diffusers>=0.35.0               # group offloading + GGUF

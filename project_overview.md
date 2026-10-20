@@ -167,19 +167,24 @@ Save CSV + figures + failure examples
 
 ```text
 results/
-├── metrics.csv
-├── summary.csv
-├── qualitative_comparison/
-├── failure_cases/
-└── plots/
+└── <ModelName>/
+    ├── metrics.csv
+    ├── summary.csv
+    ├── qualitative_comparison/
+    └── plots/
 ```
 
-Potential CLI structure:
+CLI structure:
 
 ```bash
-python benchmark.py \
+# All models
+python -m evaluation.benchmark \
     --dataset path/to/corne-val \
     --output results/
+
+# Specific model(s)
+python -m evaluation.benchmark --dataset path/to/corne-val --output results/ LaMa
+python -m evaluation.benchmark --dataset path/to/corne-val --output results/ LaMa "OpenCV Telea"
 ```
 
 The exact CLI can be changed during implementation; keep it simple and reproducible.
