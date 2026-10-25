@@ -1,33 +1,15 @@
+
 """
 PixArt-α — Diffusion Transformer (DiT) inpainting model.
 
-Replaces FLUX.1-Fill as a lightweight diffusion-based inpainter (~0.6B
-parameters in the DiT backbone vs. 12B in FLUX.1-Fill) that runs comfortably
-on consumer GPUs and Apple Silicon (MPS).
+Zero-shot inpainting: SDEdit-style partial noising + blended latent diffusion
+(background latents are re-injected outside the mask on every step).
 
-Because the official PixArt-α release in `diffusers` (`PixArtAlphaPipeline`)
-is a text-to-image model and is not registered in `AutoPipelineForInpainting`,
-this module implements **Coarse-to-Fine Blended Latent Diffusion** (following
-Avrahami et al., "Blended Latent Diffusion" / RePaint) on top of
-`PixArt-alpha/PixArt-XL-2-512x512`:
-
-1. **Coarse object removal (pre-fill)**: The masked region (`mask > 0`) is
-   first pre-filled in pixel space using OpenCV Telea (`cv2.inpaint`) so the
-   object to be erased does not leak through the VAE's 8x8 downsampling
-   receptive field or leave ghost silhouettes.
-2. **Memory-optimized T5 prompt caching**: Following the official Hugging Face
-   low-VRAM guide for PixArt-α, the neutral background prompt is encoded once
-   with `T5EncoderModel` and cached to `~/.cache/inpainting-bench/`. The 4.7B
-   T5 text encoder is then immediately unloaded, leaving only the 0.6B
-   `PixArtTransformer2DModel` and `AutoencoderKL` (~1.4 GB in float16) in
-   memory during inference.
-3. **Latent-space diffusion blending**: At each DDIM denoising step, the
-   known background latents (`mask == 0`) are re-noised to the current
-   timestep and blended with the denoised foreground latents (`mask > 0`),
-   allowing DiT global self-attention to synthesize coherent background
-   texture that seamlessly matches the surrounding scene.
-4. **Pixel-space compositing**: The decoded result is resized back to the
-   original image resolution and composited strictly inside `mask > 0`.
+Pipeline:
+  1. Crop a square window with context around the mask (no aspect distortion).
+  2. Prefill the hole with OpenCV (coarse Telea + fine NS) for a sane init.
+  3. Denoise the masked region with PixArt-α (prompt + CFG).
+  4. Paste the result back with a feathered alpha mask.
 """
 
 import gc
@@ -45,21 +27,14 @@ from .base import BaseInpainter, InpaintResult
 
 DEFAULT_MODEL_ID = "PixArt-alpha/PixArt-XL-2-512x512"
 _CACHE_DIR = Path.home() / ".cache" / "inpainting-bench"
-_PROMPT_CACHE_FILE = _CACHE_DIR / "pixart_alpha_prompt_embeds_v1.pt"
+# v3: new file name -> old (empty-prompt) cache is ignored
+_PROMPT_CACHE_FILE = _CACHE_DIR / "pixart_alpha_prompt_v3.pt"
 
-# Neutral background restoration prompts for object removal
-_DEFAULT_PROMPT = (
-    "clean empty background, natural scene texture, "
-    "seamless continuation, high quality photo"
-)
-_DEFAULT_NEGATIVE_PROMPT = (
-    "object, foreground object, person, text, watermark, "
-    "logo, artifacts, blurry, distorted, unnatural seam"
-)
+PROMPT = "a clean photo, empty background, seamless natural texture"
+NEG_PROMPT = "object, text, watermark, blurry, smudge, low quality"
 
 
 def _patch_ssl_if_needed() -> None:
-    """Use certifi CA bundle on macOS so Hugging Face downloads do not fail."""
     try:
         import certifi
 
@@ -71,33 +46,17 @@ def _patch_ssl_if_needed() -> None:
 
 
 class PixArtInpainter(BaseInpainter):
-    """
-    Diffusion Transformer inpainting model based on PixArt-α (0.6B).
-
-    Implements the `BaseInpainter` contract:
-        result = PixArtInpainter().inpaint(image_rgb_uint8, mask_uint8)
-    """
-
     def __init__(
         self,
         model_id: str = DEFAULT_MODEL_ID,
         device: str | torch.device | None = None,
-        num_inference_steps: int = 20,
-        strength: float = 0.80,
-        guidance_scale: float = 3.5,
+        num_inference_steps: int = 50,
+        strength: float = 1,
+        guidance_scale: float = 7.5,
         seed: int = 42,
+        context: float = 2.5,
+        min_crop: int = 256,
     ):
-        """
-        Args:
-            model_id:            Hugging Face repo ID for PixArt-α weights.
-            device:              Target torch device ('cuda', 'mps', or 'cpu').
-                                 Auto-detected when None.
-            num_inference_steps: Total DDIM schedule steps (default: 20).
-            strength:            Fraction of diffusion schedule to run on the
-                                 Telea-prefilled image (0 < strength <= 1.0).
-            guidance_scale:      Classifier-free guidance scale (default: 3.5).
-            seed:                Random seed for reproducible latent noise.
-        """
         _patch_ssl_if_needed()
 
         self.model_id = model_id
@@ -111,11 +70,11 @@ class PixArtInpainter(BaseInpainter):
         self.strength = float(np.clip(strength, 0.05, 1.0))
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.context = context      # crop side = mask size * context
+        self.min_crop = min_crop    # minimal crop side in pixels
 
         from diffusers import DDIMScheduler, PixArtAlphaPipeline
 
-        # 1. Load or compute cached T5 prompt embeddings so we don't keep the
-        #    heavy 4.7B T5 text encoder in memory during image inpainting.
         (
             self._prompt_embeds,
             self._prompt_attn_mask,
@@ -123,15 +82,12 @@ class PixArtInpainter(BaseInpainter):
             self._neg_prompt_attn_mask,
         ) = self._load_or_encode_prompt(model_id)
 
-        # 2. Load only the 0.6B DiT transformer and VAE (~1.4 GB in fp16).
         self.pipe = PixArtAlphaPipeline.from_pretrained(
             model_id,
             text_encoder=None,
             tokenizer=None,
             torch_dtype=self.dtype,
         )
-        # Single-step Markovian DDIM scheduler works best for RePaint-style
-        # per-step latent blending.
         self.pipe.scheduler = DDIMScheduler.from_config(
             self.pipe.scheduler.config
         )
@@ -169,16 +125,16 @@ class PixArtInpainter(BaseInpainter):
     def _load_or_encode_prompt(
         self, model_id: str
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Return cached T5 embeddings for the background restoration prompt,
-        computing and saving them once on first use, then freeing T5.
-        """
         if _PROMPT_CACHE_FILE.exists():
             try:
                 cached = torch.load(
                     _PROMPT_CACHE_FILE, map_location="cpu", weights_only=True
                 )
-                if cached.get("model_id") == model_id:
+                if (
+                    cached.get("model_id") == model_id
+                    and cached.get("prompt") == PROMPT
+                    and cached.get("neg_prompt") == NEG_PROMPT
+                ):
                     return (
                         cached["prompt_embeds"].to(
                             device=self.device, dtype=self.dtype
@@ -194,7 +150,6 @@ class PixArtInpainter(BaseInpainter):
 
         from diffusers import PixArtAlphaPipeline
 
-        # Encode once with the text encoder only (transformer=None, vae=None)
         encoder_pipe = PixArtAlphaPipeline.from_pretrained(
             model_id,
             transformer=None,
@@ -209,9 +164,9 @@ class PixArtInpainter(BaseInpainter):
                 neg_prompt_embeds,
                 neg_prompt_attn_mask,
             ) = encoder_pipe.encode_prompt(
-                prompt=_DEFAULT_PROMPT,
+                prompt=PROMPT,
                 do_classifier_free_guidance=True,
-                negative_prompt=_DEFAULT_NEGATIVE_PROMPT,
+                negative_prompt=NEG_PROMPT,
                 num_images_per_prompt=1,
                 device=self.device,
                 clean_caption=False,
@@ -222,6 +177,8 @@ class PixArtInpainter(BaseInpainter):
         torch.save(
             {
                 "model_id": model_id,
+                "prompt": PROMPT,
+                "neg_prompt": NEG_PROMPT,
                 "prompt_embeds": prompt_embeds.cpu(),
                 "prompt_attn_mask": prompt_attn_mask.cpu(),
                 "neg_prompt_embeds": neg_prompt_embeds.cpu(),
@@ -241,40 +198,124 @@ class PixArtInpainter(BaseInpainter):
             neg_prompt_attn_mask.to(device=self.device),
         )
 
+    # ── context crop ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _context_crop(
+        mask: np.ndarray, h: int, w: int, context: float, min_side: int
+    ) -> tuple[int, int, int]:
+        """Square window centred on the mask, `context`x larger than the mask."""
+        ys, xs = np.where(mask > 0)
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        side = int(max(y1 - y0, x1 - x0) * context)
+        side = min(max(side, min_side), h, w)
+        top = int(np.clip((y0 + y1) / 2 - side / 2, 0, h - side))
+        left = int(np.clip((x0 + x1) / 2 - side / 2, 0, w - side))
+        return top, left, side
+
+    # ── prefill ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _multiscale_prefill(
+        image: np.ndarray, binary_mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        h, w = image.shape[:2]
+
+        # Dilation depends on the OBJECT size (not image size): covers
+        # antialiasing / halo on the object edge.
+        ys, xs = np.where(binary_mask > 0)
+        obj_size = max(ys.max() - ys.min(), xs.max() - xs.min())
+        dil_radius = int(np.clip(obj_size * 0.08, 8, 60))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * dil_radius + 1, 2 * dil_radius + 1)
+        )
+        work_mask = cv2.dilate(binary_mask, kernel, iterations=1)
+
+        # Coarse pyramid fill at 1/4 resolution for clean global color gradient
+        small_w, small_h = max(64, w // 4), max(64, h // 4)
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        small_bgr = cv2.resize(
+            bgr, (small_w, small_h), interpolation=cv2.INTER_AREA
+        )
+        small_mask = cv2.resize(
+            work_mask, (small_w, small_h), interpolation=cv2.INTER_NEAREST
+        )
+        coarse_bgr = cv2.inpaint(small_bgr, small_mask, 15, cv2.INPAINT_TELEA)
+        coarse_up_bgr = cv2.resize(
+            coarse_bgr, (w, h), interpolation=cv2.INTER_CUBIC
+        )
+
+        # Full-res Navier-Stokes fill for boundary structure
+        fine_bgr = cv2.inpaint(bgr, work_mask, 15, cv2.INPAINT_NS)
+        blended_bgr = cv2.addWeighted(coarse_up_bgr, 0.70, fine_bgr, 0.30, 0)
+
+        # Feathered alpha mask for seamless transition
+        soft_alpha = cv2.GaussianBlur(
+            work_mask.astype(np.float32),
+            (0, 0),
+            sigmaX=max(3.0, dil_radius * 0.45),
+        )[..., None]
+        soft_alpha = np.maximum(
+            soft_alpha, binary_mask[..., None].astype(np.float32)
+        )
+
+        orig_f = bgr.astype(np.float32)
+        prefilled_bgr = (
+            orig_f * (1.0 - soft_alpha) + blended_bgr.astype(np.float32) * soft_alpha
+        ).clip(0, 255).astype(np.uint8)
+
+        prefilled_rgb = cv2.cvtColor(prefilled_bgr, cv2.COLOR_BGR2RGB)
+        return prefilled_rgb, work_mask, soft_alpha
+
     @property
     def name(self) -> str:
         return "PixArt-α"
 
+    # ── public API: crop wrapper ───────────────────────────────────────────────
+
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> InpaintResult:
-        """
-        Remove the masked object from `image` and reconstruct the background.
+        binary = (mask > 0).astype(np.uint8)
 
-        Args:
-            image: RGB image, dtype uint8, shape (H, W, 3).
-            mask:  Binary mask, dtype uint8, shape (H, W).
-                   Pixels with value > 0 are the region to inpaint.
-
-        Returns:
-            InpaintResult containing the inpainted RGB image and inference time.
-        """
-        orig_h, orig_w = image.shape[:2]
-        binary_mask = (mask > 0).astype(np.uint8)
-
-        # Fast path when mask is completely empty
-        if not np.any(binary_mask):
+        if not np.any(binary):
             return InpaintResult(
                 image=image.copy(),
                 inference_time=0.0,
                 metadata={"device": str(self.device), "steps": 0},
             )
 
-        # 1. Coarse pre-fill in pixel space using OpenCV Telea so the object
-        #    inside the mask is erased before VAE encoding.
-        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        prefilled_bgr = cv2.inpaint(bgr, binary_mask, 5, cv2.INPAINT_TELEA)
-        prefilled_rgb = cv2.cvtColor(prefilled_bgr, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+        top, left, side = self._context_crop(
+            binary, h, w, self.context, self.min_crop
+        )
+        sl = (slice(top, top + side), slice(left, left + side))
 
-        # 2. Resize to PixArt-α native resolution (512x512)
+        res = self._inpaint_square(
+            np.ascontiguousarray(image[sl]),
+            np.ascontiguousarray(binary[sl]),
+        )
+
+        out = image.copy()
+        out[sl] = res.image
+        meta = dict(res.metadata)
+        meta["crop"] = (top, left, side)
+        return InpaintResult(
+            image=out, inference_time=res.inference_time, metadata=meta
+        )
+
+    # ── core: square crop inpainting ───────────────────────────────────────────
+
+    def _inpaint_square(
+        self, image: np.ndarray, binary_mask: np.ndarray
+    ) -> InpaintResult:
+        orig_h, orig_w = image.shape[:2]
+
+        start_time = time.perf_counter()
+
+        prefilled_rgb, work_mask, soft_alpha = self._multiscale_prefill(
+            image, binary_mask
+        )
+
         target_res = 512
         img_512 = np.array(
             Image.fromarray(prefilled_rgb).resize(
@@ -282,12 +323,11 @@ class PixArtInpainter(BaseInpainter):
             )
         )
         mask_512 = np.array(
-            Image.fromarray(binary_mask * 255).resize(
+            Image.fromarray(work_mask * 255).resize(
                 (target_res, target_res), Image.NEAREST
             )
         )
 
-        # Convert image to [-1, 1] tensor: (1, 3, 512, 512)
         img_tensor = (
             torch.from_numpy(img_512)
             .permute(2, 0, 1)
@@ -297,7 +337,6 @@ class PixArtInpainter(BaseInpainter):
         )
         img_tensor = (img_tensor / 127.5) - 1.0
 
-        # Build latent-space mask: (1, 1, 64, 64) with 1 = region to generate
         latent_size = target_res // self.pipe.vae_scale_factor
         mask_tensor = (
             torch.from_numpy((mask_512 > 0).astype(np.float32))
@@ -306,23 +345,19 @@ class PixArtInpainter(BaseInpainter):
             .to(device=self.device, dtype=self.dtype)
         )
         latent_mask = F.interpolate(
-            mask_tensor, size=(latent_size, latent_size), mode="nearest"
-        )
-        # Dilate by 1 latent cell and feather slightly to avoid boundary seams
-        latent_mask = F.max_pool2d(
-            latent_mask, kernel_size=3, stride=1, padding=1
+            mask_tensor,
+            size=(latent_size, latent_size),
+            mode="bilinear",
+            align_corners=False,
         )
         latent_mask = F.avg_pool2d(
-            latent_mask, kernel_size=3, stride=1, padding=1
+            latent_mask, kernel_size=5, stride=1, padding=2
         )
 
-        start_time = time.perf_counter()
         with torch.no_grad():
-            # Encode coarse-filled image into VAE latent space
             posterior = self.pipe.vae.encode(img_tensor).latent_dist
             init_latents = posterior.mean * self.pipe.vae.config.scaling_factor
 
-            # Set up DDIM timesteps and slice according to `self.strength`
             self.pipe.scheduler.set_timesteps(
                 self.num_inference_steps, device=self.device
             )
@@ -333,7 +368,6 @@ class PixArtInpainter(BaseInpainter):
             )
             active_timesteps = timesteps[init_step:]
 
-            # Sample deterministic Gaussian noise
             generator = torch.Generator(device="cpu").manual_seed(self.seed)
             noise = torch.randn(
                 init_latents.shape,
@@ -341,12 +375,10 @@ class PixArtInpainter(BaseInpainter):
                 dtype=self.dtype,
             ).to(self.device)
 
-            # Noise the initial latents to the starting timestep
             latents = self.pipe.scheduler.add_noise(
                 init_latents, noise, active_timesteps[:1]
             )
 
-            # Prepare classifier-free guidance embeddings and micro-conditions
             do_cfg = self.guidance_scale > 1.0
             if do_cfg:
                 prompt_embeds = torch.cat(
@@ -380,7 +412,6 @@ class PixArtInpainter(BaseInpainter):
 
             latent_channels = init_latents.shape[1]
 
-            # 3. RePaint / Blended Latent Diffusion loop
             for i, t in enumerate(active_timesteps):
                 latent_model_input = (
                     torch.cat([latents] * 2) if do_cfg else latents
@@ -419,7 +450,6 @@ class PixArtInpainter(BaseInpainter):
                         noise_pred_text - noise_pred_uncond
                     )
 
-                # PixArt-α DiT outputs 8 channels (4 noise + 4 learned variance)
                 if (
                     self.pipe.transformer.config.out_channels // 2
                     == latent_channels
@@ -430,7 +460,6 @@ class PixArtInpainter(BaseInpainter):
                     noise_pred, t, latents, return_dict=False
                 )[0]
 
-                # Blend known background latents with denoised hole latents
                 if i < len(active_timesteps) - 1:
                     next_t = active_timesteps[i + 1]
                     bg_latents = self.pipe.scheduler.add_noise(
@@ -446,7 +475,6 @@ class PixArtInpainter(BaseInpainter):
                         + latents * latent_mask
                     )
 
-            # Decode latents back to pixel space
             decoded = self.pipe.vae.decode(
                 latents / self.pipe.vae.config.scaling_factor,
                 return_dict=False,
@@ -454,18 +482,18 @@ class PixArtInpainter(BaseInpainter):
 
         inference_time = time.perf_counter() - start_time
 
-        # 4. Postprocess: [-1, 1] -> uint8 RGB, resize to original (orig_w, orig_h)
         out_img = decoded.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
         out_img = ((out_img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
         out_img = np.array(
             Image.fromarray(out_img).resize((orig_w, orig_h), Image.LANCZOS)
         )
 
-        # Blend strictly inside the masked region so background pixels stay untouched
+        # Blend with the feathered dilated mask: outside it the original
+        # pixels are untouched, so there is no seam when pasting the crop back.
         final_img = (
-            image * (binary_mask[..., None] == 0)
-            + out_img * (binary_mask[..., None] > 0)
-        ).astype(np.uint8)
+            image.astype(np.float32) * (1.0 - soft_alpha)
+            + out_img.astype(np.float32) * soft_alpha
+        ).clip(0, 255).astype(np.uint8)
 
         return InpaintResult(
             image=final_img,
