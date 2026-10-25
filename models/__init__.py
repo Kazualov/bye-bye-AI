@@ -2,6 +2,7 @@ from .base import BaseInpainter, InpaintResult
 from .opencv_telea import OpenCVTelea
 from .lama import LaMaInpainter
 from .vitinpainter import ViTInpainter
+from .pixart import PixArtInpainter
 from .flux_fill import FluxFillInpainter
 
 __all__ = [
@@ -10,5 +11,6 @@ __all__ = [
     "OpenCVTelea",
     "LaMaInpainter",
     "ViTInpainter",
+    "PixArtInpainter",
     "FluxFillInpainter",
 ]

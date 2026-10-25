@@ -9,6 +9,7 @@ Usage
     # Run specific model(s)
     python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa
     python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa "OpenCV Telea"
+    python -m evaluation.benchmark --dataset data/corne-val --output results/ "PixArt-α"
 
 The script loads every sample in the CORNE-Val dataset, runs each requested
 model under every mask variant, computes PSNR / SSIM / LPIPS / inference-time
@@ -50,7 +51,10 @@ from models.lama import LaMaInpainter
 # ── model registry ─────────────────────────────────────────────────────────────
 
 # Canonical model names — used for CLI validation and build_models().
-AVAILABLE_MODELS = ("OpenCV Telea", "LaMa", "ViTInpainter", "FLUX.1-Fill")
+AVAILABLE_MODELS = ("OpenCV Telea", "LaMa", "ViTInpainter", "PixArt-α")
+
+# Accepted CLI aliases for PixArt-α (including legacy FLUX.1-Fill name)
+_PIXART_ALIASES = {"pixart-α", "pixart-alpha", "pixart", "flux.1-fill", "flux"}
 
 
 # ── dataset loading ────────────────────────────────────────────────────────────
@@ -108,6 +112,8 @@ def _want(name: str, model_filter: list[str] | None) -> bool:
     """Return True if `name` is requested by the filter (case-insensitive)."""
     if model_filter is None:
         return True
+    if name == "PixArt-α":
+        return any(n.lower() in _PIXART_ALIASES for n in model_filter)
     return any(n.lower() == name.lower() for n in model_filter)
 
 
@@ -121,8 +127,8 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         If provided, only models whose names appear in this list are loaded
         (matched case-insensitively). If None, all available models are loaded.
 
-    Models that are not yet implemented (ViTInpainter, FluxFill) are silently
-    skipped so the benchmark runs with whatever is ready.
+    Models that are not yet implemented or fail to load are skipped so the
+    benchmark runs with whatever is ready.
     """
     models = {}
 
@@ -135,7 +141,7 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         except Exception as e:
             print(f"  [skip] LaMa could not be loaded: {e}")
 
-    # Alexander's model — add when implemented
+    # Alexander's model
     if _want("ViTInpainter", model_filter):
         try:
             from models.vitinpainter import ViTInpainter
@@ -145,15 +151,15 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         except Exception as e:
             print(f"  [skip] ViTInpainter: {e}")
 
-    # Egor's model — add when implemented
-    if _want("FLUX.1-Fill", model_filter):
+    # Egor's model — PixArt-α (replaces FLUX.1-Fill)
+    if _want("PixArt-α", model_filter):
         try:
-            from models.flux_fill import FluxFillInpainter
-            models["FLUX.1-Fill"] = FluxFillInpainter()
+            from models.pixart import PixArtInpainter
+            models["PixArt-α"] = PixArtInpainter()
         except NotImplementedError:
             pass  # not yet implemented
         except Exception as e:
-            print(f"  [skip] FLUX.1-Fill: {e}")
+            print(f"  [skip] PixArt-α: {e}")
 
     return models
 
@@ -305,10 +311,8 @@ def main() -> None:
 
     # Validate model names before loading anything
     if args.models:
-        unknown = [
-            m for m in args.models
-            if not any(m.lower() == a.lower() for a in AVAILABLE_MODELS)
-        ]
+        valid_names = {a.lower() for a in AVAILABLE_MODELS} | _PIXART_ALIASES
+        unknown = [m for m in args.models if m.lower() not in valid_names]
         if unknown:
             parser.error(
                 f"Unknown model(s): {', '.join(repr(m) for m in unknown)}. "
