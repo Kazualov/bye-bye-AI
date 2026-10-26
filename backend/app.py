@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 from typing import List
 
+import numpy as np
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,8 +22,27 @@ MODELS = [
     {"id": "flux",  "name": "FLUX.1-Fill",   "type": "diffusion",   "available": True},
 ]
 
-# Mock inference times per model (seconds). Real models will replace this.
-MOCK_DELAYS = {"telea": 0.2, "lama": 1.0, "vit": 1.5, "flux": 3.0}
+_MODEL_CACHE = {}
+
+
+def get_model(mid: str):
+    """Lazy-load and cache inpainter instances."""
+    if mid not in _MODEL_CACHE:
+        if mid == "vit":
+            from models.vitinpainter import ViTInpainter
+            _MODEL_CACHE[mid] = ViTInpainter()
+        elif mid == "telea":
+            from models.opencv_telea import OpenCVTelea
+            _MODEL_CACHE[mid] = OpenCVTelea()
+        elif mid == "lama":
+            from models.lama import LaMaInpainter
+            _MODEL_CACHE[mid] = LaMaInpainter()
+        elif mid == "flux":
+            from models.flux_fill import FluxFillInpainter
+            _MODEL_CACHE[mid] = FluxFillInpainter()
+        else:
+            raise ValueError(f"Unknown model ID: {mid}")
+    return _MODEL_CACHE[mid]
 
 JOBS = {}
 
@@ -45,10 +65,12 @@ def list_models():
     return {"models": MODELS}
 
 
-def _run_models(job_id: str, image_path: str, model_ids: List[str]) -> None:
-    """Mock inference: copy the input image as the output for each model."""
+def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: List[str]) -> None:
     job = JOBS[job_id]
     job["status"] = "running"
+
+    img_arr = np.array(Image.open(image_path).convert("RGB"))
+    msk_arr = np.array(Image.open(mask_path).convert("L"))
 
     for mid in model_ids:
         entry = next(r for r in job["results"] if r["model"] == mid)
@@ -57,13 +79,16 @@ def _run_models(job_id: str, image_path: str, model_ids: List[str]) -> None:
 
         t0 = time.time()
         try:
-            time.sleep(MOCK_DELAYS.get(mid, 0.5))
+            model = get_model(mid)
+            result = model.inpaint(img_arr, msk_arr)
             out_name = f"{mid}.png"
             out_path = STORAGE / job_id / out_name
-            shutil.copy(image_path, out_path)
+            out_img = Image.fromarray(result.image)
+            out_img.save(out_path)
             entry["status"] = "succeeded"
             entry["output_url"] = f"/files/{job_id}/{out_name}"
-            entry["runtime_ms"] = int((time.time() - t0) * 1000)
+            runtime_sec = getattr(result, "inference_time", time.time() - t0)
+            entry["runtime_ms"] = int(runtime_sec * 1000)
             log("model_done", job_id=job_id, model=mid, runtime_ms=entry["runtime_ms"])
         except Exception as exc:
             entry["status"] = "failed"
@@ -146,7 +171,7 @@ async def create_job(
     }
     log("job_created", job_id=job_id, models=",".join(requested))
 
-    background.add_task(_run_models, job_id, str(image_path), requested)
+    background.add_task(_run_models, job_id, str(image_path), str(mask_path), requested)
     return {"job_id": job_id, "status": "pending"}
 
 
