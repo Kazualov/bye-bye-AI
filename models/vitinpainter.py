@@ -52,7 +52,7 @@ class ViTInpainter(BaseInpainter):
         image: np.ndarray,
         mask: np.ndarray,
         truncation_psi: float = 0.7,
-        auto_dilate: int = 0,
+        auto_dilate: int = 5,
         feather_radius: float = 3.0,
         seed: int | None = None,
     ) -> InpaintResult:
@@ -107,14 +107,14 @@ class ViTInpainter(BaseInpainter):
         # Resize the inpainted result back to the original resolution
         out_img = np.array(Image.fromarray(out_img).resize((w, h), Image.LANCZOS))
 
-        # Blend: preserve original pixels where mask==0, blend inside mask>0
+        # Blend: preserve original pixels where working_mask==0, blend inside working_mask>0
+        binary_mask = (working_mask > 0).astype(np.uint8)
         if feather_radius > 0:
-            binary_mask = (mask > 0).astype(np.uint8)
             dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 3)
             weight = np.clip(dist / float(feather_radius), 0.0, 1.0)[..., None]
             final_img = (image.astype(np.float32) * (1.0 - weight) + out_img.astype(np.float32) * weight).round().astype(np.uint8)
         else:
-            final_img = image * (mask[..., None] == 0) + out_img * (mask[..., None] > 0)
+            final_img = image * (binary_mask[..., None] == 0) + out_img * (binary_mask[..., None] > 0)
 
         return InpaintResult(
             image=final_img.astype(np.uint8),
