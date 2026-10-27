@@ -161,6 +161,7 @@ def build_models(model_filter: list[str] | None = None) -> dict:
 # ── mask experiment plan ───────────────────────────────────────────────────────
 
 # Each entry: (mask_experiment_name, base_mask_key, MaskType, dilation_radius)
+BEST_METRIC = ("lpips_full", False)
 MASK_EXPERIMENTS = [
     ("sam_native",   "mask_sam", MaskType.NATIVE,   0),
     ("sam_dilated10","mask_sam", MaskType.DILATED,  10),
@@ -194,21 +195,23 @@ def run_benchmark(
         "inference_time",
     ]
 
+    metric_name, higher_is_better = BEST_METRIC
+
     for model_name, model in models.items():
         model_dir = output_path / model_name
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        rows = []  # one dict per (sample, mask_experiment)
+        rows = []        # (sample, mask_experiment)
+        best_rows = []   # победитель на каждый sample
 
         for sample in tqdm(samples, desc=model_name):
             sample_id = sample["id"]
             shot = sample["shot"]
             gt = sample["bg"]
-            pred_for_grid = None
+            best = None  # (score, exp_name, mask, pred)
 
             for exp_name, mask_key, mask_type, dil_radius in MASK_EXPERIMENTS:
-                base_mask = sample[mask_key]
-                mask = MaskFactory.make(base_mask, mask_type, dil_radius)
+                mask = MaskFactory.make(sample[mask_key], mask_type, dil_radius)
 
                 try:
                     result = model.inpaint(shot, mask)
@@ -232,46 +235,67 @@ def run_benchmark(
                     "inference_time":  result.inference_time,
                 })
 
-                # collect sam_native prediction for the qualitative grid
-                if exp_name == "sam_native":
-                    pred_for_grid = result.image
+                score = getattr(metrics, metric_name)
+                if np.isnan(score):
+                    continue
+                if best is None or (score > best[0] if higher_is_better else score < best[0]):
+                    best = (score, exp_name, mask, result.image)
 
-            # qualitative comparison grid for this sample
-            if pred_for_grid is not None:
+            # одна лучшая картинка на сэмпл
+            if best is not None:
+                score, exp_name, mask, pred = best
                 save_comparison_grid(
-                    sample_id=sample_id,
+                    sample_id=f"{sample_id}__{exp_name}",
                     shot=shot,
-                    mask=MaskFactory.native(sample["mask_sam"]),
+                    mask=mask,                      # реально использованная маска
                     ground_truth=gt,
-                    predictions={model_name: pred_for_grid},
-                    output_dir=model_dir / "qualitative_comparison",
+                    predictions={model_name: pred},
+                    output_dir=model_dir / "qualitative_best",
                 )
+                best_rows.append({
+                    "sample_id": sample_id,
+                    "best_mask": exp_name,
+                    metric_name: score,
+                })
 
-        # ── save per-row CSV ───────────────────────────────────────────────────
+        # ── per-row CSV ────────────────────────────────────────────────────────
         df = pd.DataFrame(rows)
         df.to_csv(model_dir / "metrics.csv", index=False)
         print(f"\n[{model_name}] Saved metrics.csv  ({len(df)} rows)")
 
-        # ── aggregate summary ──────────────────────────────────────────────────
+        # ── summary по маскам ──────────────────────────────────────────────────
         summary_df = (
             df.groupby("mask_experiment")[metric_cols]
             .agg(["mean", "std"])
             .round(4)
         )
         summary_df.to_csv(model_dir / "summary.csv")
-        print(f"[{model_name}] Saved summary.csv")
 
-        # ── plots ──────────────────────────────────────────────────────────────
+        # ── какая маска лучше справилась ───────────────────────────────────────
+        best_df = pd.DataFrame(best_rows)
+        best_df.to_csv(model_dir / "best_per_sample.csv", index=False)
+
+        wins = best_df["best_mask"].value_counts().rename("wins")
+        mean_score = df.groupby("mask_experiment")[metric_name].mean().rename(f"mean_{metric_name}")
+        ranking = (
+            pd.concat([wins, mean_score], axis=1)
+            .fillna({"wins": 0})
+            .astype({"wins": int})
+            .sort_values(f"mean_{metric_name}", ascending=not higher_is_better)
+        )
+        ranking.to_csv(model_dir / "mask_ranking.csv")
+
+        print(f"\n[{model_name}] Ranking масок по {metric_name}:")
+        print(ranking.to_string())
+        print(f"[{model_name}] Лучшая маска: {ranking.index[0]}")
+
+        # ── plots (как раньше, по sam_native) ──────────────────────────────────
         sam_native = df[df["mask_experiment"] == "sam_native"]
-        summary_dict = {
-            model_name: sam_native[metric_cols].mean().to_dict()
-        }
-        save_metric_plots(summary_dict, model_dir / "plots")
-        print(f"[{model_name}] Saved plots/")
+        save_metric_plots({model_name: sam_native[metric_cols].mean().to_dict()}, model_dir / "plots")
 
         print(f"[{model_name}] All results written to {model_dir}")
 
-    print(f"\nDone. Output root: {output_path}")
+    print(f"\nDone. Output root:{output_path}")
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────

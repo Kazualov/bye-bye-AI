@@ -1,63 +1,95 @@
+import asyncio
 import io
-import shutil
+import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
-import asyncio
+
 import numpy as np
-
-
 from fastapi import (BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile,
                      WebSocket, WebSocketDisconnect)
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from models.lama import LaMaInpainter
-from models.opencv_telea import OpenCVTelea
-from models.vitinpainter import ViTInpainter
-
 APP_VERSION = "0.1.0"
 STORAGE = Path("storage")
 STORAGE.mkdir(exist_ok=True)
 
 MODELS = [
-    {"id": "telea", "name": "OpenCV Telea", "type": "classical",   "available": True},
-    {"id": "lama",  "name": "LaMa",          "type": "cnn",         "available": True},
-    {"id": "vit",   "name": "ViTInpainter",  "type": "transformer", "available": True},
-    {"id": "flux",  "name": "FLUX.1-Fill",   "type": "diffusion",   "available": True},
+    {"id": "telea", "name": "OpenCV Telea", "type": "classical", "available": True},
+    {"id": "lama", "name": "LaMa", "type": "cnn", "available": True},
+    {"id": "vit", "name": "ViTInpainter", "type": "transformer", "available": True},
+    {"id": "flux", "name": "FLUX.1-Fill", "type": "diffusion", "available": True},
 ]
 
-# Mock inference times per model (seconds). Real models will replace this.
-MOCK_DELAYS = {"telea": 0.2, "lama": 1.0, "vit": 1.5, "flux": 3.0}
+WARMUP_MODELS = ("lama",)
+
+_MODEL_CACHE = {}
+_LOAD_LOCK = threading.Lock()
+_RUN_LOCK = threading.Lock()
+
+
+def get_model(mid: str):
+    """Lazy-load and cache inpainter instances."""
+    with _LOAD_LOCK:
+        if mid not in _MODEL_CACHE:
+            if mid == "vit":
+                from models.vitinpainter import ViTInpainter
+                _MODEL_CACHE[mid] = ViTInpainter()
+            elif mid == "telea":
+                from models.opencv_telea import OpenCVTelea
+                _MODEL_CACHE[mid] = OpenCVTelea()
+            elif mid == "lama":
+                from models.lama import LaMaInpainter
+                _MODEL_CACHE[mid] = LaMaInpainter()
+            elif mid == "flux":
+                from models.flux_fill import FluxFillInpainter
+                _MODEL_CACHE[mid] = FluxFillInpainter()
+            else:
+                raise ValueError(f"Unknown model ID: {mid}")
+        return _MODEL_CACHE[mid]
+
+
+def _free_gpu() -> None:
+    """After a CUDA OOM the next model in the same job shouldn't fail too."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 
 JOBS = {}
 
-app = FastAPI(title="Inpainting API", version=APP_VERSION)
 
-print("Loading models (this may take a while on first run)...")
-try:
-    telea_model = OpenCVTelea()
-    print("✓ Telea loaded")
-except Exception as e:
-    telea_model = None
-    print(f"✗ Telea failed to load: {e}")
+def log(event: str, **fields) -> None:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    kv = " ".join(f"{k}={v}" for k, v in fields.items())
+    print(f"[{ts}] {event} {kv}", flush=True)
 
-try:
-    lama_model = LaMaInpainter()
-    print("✓ LaMa loaded")
-except Exception as e:
-    lama_model = None
-    print(f"✗ LaMa failed to load: {e}")
 
-try:
-    vit_model = ViTInpainter()
-    print("✓ ViT loaded")
-except Exception as e:
-    vit_model = None
-    print(f"✗ ViT failed to load: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    def warmup():
+        for mid in WARMUP_MODELS:
+            try:
+                get_model(mid)
+                log("model_ready", model=mid)
+            except Exception as e:
+                log("model_load_failed", model=mid, error=str(e))
 
+    threading.Thread(target=warmup, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Inpainting API", version=APP_VERSION, lifespan=lifespan)
+
+
+# --- WebSocket Manager ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, list[WebSocket]] = {}
@@ -80,13 +112,8 @@ class ConnectionManager:
                 except Exception:
                     pass
 
+
 manager = ConnectionManager()
-
-
-def log(event: str, **fields) -> None:
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    kv = " ".join(f"{k}={v}" for k, v in fields.items())
-    print(f"[{ts}] {event} {kv}", flush=True)
 
 
 @app.get("/api/v1/health")
@@ -105,8 +132,8 @@ async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: L
     await manager.broadcast(job_id, job)
 
     try:
-        img_np = np.array(Image.open(image_path).convert("RGB"))
-        mask_np = np.array(Image.open(mask_path).convert("L"))
+        img_arr = np.array(Image.open(image_path).convert("RGB"))
+        msk_arr = np.array(Image.open(mask_path).convert("L"))
     except Exception as e:
         log("job_failed", job_id=job_id, error=f"Failed to load image/mask: {e}")
         job["status"] = "failed"
@@ -120,43 +147,32 @@ async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: L
         log("model_start", job_id=job_id, model=mid)
 
         try:
+            t0 = time.time()
+            model = get_model(mid)
+
+            # Запускаем инференс в отдельном потоке, чтобы не блокировать event loop (WebSockets)
+            def run_inference():
+                with _RUN_LOCK:
+                    return model.inpaint(img_arr, msk_arr)
+
+            result = await asyncio.to_thread(run_inference)
+
             out_name = f"{mid}.png"
             out_path = STORAGE / job_id / out_name
-
-            if mid == "telea":
-                if not telea_model: raise Exception("Telea model not loaded")
-                result = telea_model.inpaint(img_np, mask_np)
-                Image.fromarray(result.image).save(out_path)
-                entry["runtime_ms"] = int(result.inference_time * 1000)
-
-            elif mid == "lama":
-                if not lama_model: raise Exception("LaMa model not loaded")
-                result = await asyncio.to_thread(lama_model.inpaint, img_np, mask_np)
-                Image.fromarray(result.image).save(out_path)
-                entry["runtime_ms"] = int(result.inference_time * 1000)
-
-            elif mid == "vit":
-                if not vit_model: raise Exception("ViT model not loaded")
-                result = await asyncio.to_thread(vit_model.inpaint, img_np, mask_np)
-                Image.fromarray(result.image).save(out_path)
-                entry["runtime_ms"] = int(result.inference_time * 1000)
-
-            elif mid == "flux":
-                await asyncio.sleep(1.0)
-                shutil.copy(image_path, out_path)
-                entry["runtime_ms"] = 1000
-
-            else:
-                raise Exception(f"Unknown model ID: {mid}")
-
+            Image.fromarray(result.image).save(out_path)
             entry["status"] = "succeeded"
             entry["output_url"] = f"/files/{job_id}/{out_name}"
+
+            runtime_sec = getattr(result, "inference_time", time.time() - t0)
+            entry["runtime_ms"] = int(runtime_sec * 1000)
             log("model_done", job_id=job_id, model=mid, runtime_ms=entry["runtime_ms"])
 
         except Exception as exc:
+            _free_gpu()
+            msg = str(exc) or type(exc).__name__
             entry["status"] = "failed"
-            entry["error"] = str(exc)
-            log("model_failed", job_id=job_id, model=mid, error=str(exc))
+            entry["error"] = msg
+            log("model_failed", job_id=job_id, model=mid, error=msg)
 
         await manager.broadcast(job_id, job)
 
@@ -174,10 +190,10 @@ async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: L
 
 @app.post("/api/v1/jobs", status_code=202)
 async def create_job(
-    background: BackgroundTasks,
-    image: UploadFile = File(...),
-    mask: UploadFile = File(...),
-    models: str = Form(...),
+        background: BackgroundTasks,
+        image: UploadFile = File(...),
+        mask: UploadFile = File(...),
+        models: str = Form(...),
 ):
     img_bytes = await image.read()
     mask_bytes = await mask.read()
@@ -201,6 +217,13 @@ async def create_job(
             "message": f"mask size {msk.size} != image size {img.size}",
         })
 
+    msk_l = msk.convert("L")
+    if not np.array(msk_l).any():
+        raise HTTPException(400, detail={
+            "error": "invalid_mask",
+            "message": "mask is empty (nothing to inpaint)",
+        })
+
     requested = [m.strip() for m in models.split(",") if m.strip()]
     if not requested:
         raise HTTPException(400, detail={"error": "invalid_model", "message": "no models selected"})
@@ -216,9 +239,10 @@ async def create_job(
 
     image_path = job_dir / "input.png"
     mask_path = job_dir / "mask.png"
+
     img.convert("RGB").save(image_path)
-    img.convert("RGB").save(image_path)
-    msk = msk.convert("L").point(lambda p: 255 if p > 127 else 0)
+    # Бинаризация маски (фикс белых объектов)
+    msk = msk_l.point(lambda p: 255 if p > 127 else 0)
     msk.save(mask_path)
 
     JOBS[job_id] = {
@@ -260,13 +284,12 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 
     await manager.connect(job_id, websocket)
     try:
-        # Сразу отправляем текущий статус задачи
         await websocket.send_json(JOBS[job_id])
-        # Держим соединение открытым, пока клиент не отключится
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(job_id, websocket)
+
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
@@ -280,7 +303,7 @@ async def http_exception_handler(request, exc: HTTPException):
 # Serve generated files (input, mask, outputs)
 app.mount("/files", StaticFiles(directory=str(STORAGE)), name="files")
 
-# Serve the frontend if the folder exists (added later, not yet)
+# Serve the frontend if the folder exists
 FRONTEND_DIR = Path("frontend")
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
