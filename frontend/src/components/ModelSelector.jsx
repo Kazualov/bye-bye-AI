@@ -2,7 +2,7 @@ const ALL_MODELS = [
   { id: 'telea', label: 'OpenCV Telea' },
   { id: 'lama', label: 'LaMa' },
   { id: 'vit', label: 'ViTInpainter' },
-  { id: 'flux', label: 'FLUX.1-Fill' },
+  //{ id: 'flux', label: 'FLUX.1-Fill' },
 ]
 
 export default function ModelSelector({ selected, onChange }) {
