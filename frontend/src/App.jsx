@@ -31,7 +31,7 @@ async function buildMaskBlob(imgEl, paths) {
 export default function App() {
   const [image, setImage] = useState(null) // { el, blob }
   const [paths, setPaths] = useState([])
-  const [models, setModels] = useState(['telea', 'lama', 'vit', 'flux'])
+  const [models, setModels] = useState(['telea', 'lama', 'vit'])
   const [jobId, setJobId] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)

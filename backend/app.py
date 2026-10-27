@@ -22,7 +22,7 @@ MODELS = [
     {"id": "telea", "name": "OpenCV Telea", "type": "classical", "available": True},
     {"id": "lama", "name": "LaMa", "type": "cnn", "available": True},
     {"id": "vit", "name": "ViTInpainter", "type": "transformer", "available": True},
-    {"id": "flux", "name": "FLUX.1-Fill", "type": "diffusion", "available": True},
+    #{"id": "flux", "name": "FLUX.1-Fill", "type": "diffusion", "available": True},
 ]
 
 WARMUP_MODELS = ("lama",)
@@ -45,9 +45,9 @@ def get_model(mid: str):
             elif mid == "lama":
                 from models.lama import LaMaInpainter
                 _MODEL_CACHE[mid] = LaMaInpainter()
-            elif mid == "flux":
-                from models.flux_fill import FluxFillInpainter
-                _MODEL_CACHE[mid] = FluxFillInpainter()
+            # elif mid == "flux":
+            #     from models.flux_fill import FluxFillInpainter
+            #     _MODEL_CACHE[mid] = FluxFillInpainter()
             else:
                 raise ValueError(f"Unknown model ID: {mid}")
         return _MODEL_CACHE[mid]
@@ -150,7 +150,6 @@ async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: L
             t0 = time.time()
             model = get_model(mid)
 
-            # Запускаем инференс в отдельном потоке, чтобы не блокировать event loop (WebSockets)
             def run_inference():
                 with _RUN_LOCK:
                     return model.inpaint(img_arr, msk_arr)
@@ -241,7 +240,6 @@ async def create_job(
     mask_path = job_dir / "mask.png"
 
     img.convert("RGB").save(image_path)
-    # Бинаризация маски (фикс белых объектов)
     msk = msk_l.point(lambda p: 255 if p > 127 else 0)
     msk.save(mask_path)
 
