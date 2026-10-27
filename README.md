@@ -64,6 +64,13 @@ python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa
 python -m evaluation.benchmark --dataset data/corne-val --output results/ LaMa "OpenCV Telea"
 ```
 
+## Frontend mode
+```bash
+
+uvicorn backend.app:app --reload
+
+```
+
 ### CORNE-Val directory layout
 
 ```
