@@ -2,7 +2,6 @@ const ALL_MODELS = [
   { id: 'telea', label: 'OpenCV Telea' },
   { id: 'lama', label: 'LaMa' },
   { id: 'vit', label: 'ViTInpainter' },
-  //{ id: 'flux', label: 'FLUX.1-Fill' },
 ]
 
 export default function ModelSelector({ selected, onChange }) {
@@ -16,16 +15,19 @@ export default function ModelSelector({ selected, onChange }) {
 
   return (
     <div className="model-selector">
-      {ALL_MODELS.map((m) => (
-        <label key={m.id} className="model-option">
-          <input
-            type="checkbox"
-            checked={selected.includes(m.id)}
-            onChange={() => toggle(m.id)}
-          />
-          {m.label}
-        </label>
-      ))}
+      {ALL_MODELS.map((m) => {
+        const isActive = selected.includes(m.id)
+        return (
+          <button
+            key={m.id}
+            type="button"
+            className={`model-pill ${isActive ? 'active' : ''}`}
+            onClick={() => toggle(m.id)}
+          >
+            {m.label}
+          </button>
+        )
+      })}
     </div>
   )
 }

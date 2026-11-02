@@ -61,44 +61,65 @@ export default function App() {
 
   return (
     <div className="app">
-      <header>
-        <h1>Object Removal · Inpainting Demo</h1>
+      <header className="hero">
+        <h1>Object Removal <span className="accent">AI</span></h1>
         <p className="subtitle">
-          Upload an image, draw a free-form lasso around the object, pick models, and click Run.
+          Upload an image, draw a lasso around any object, and let our AI models remove it seamlessly.
         </p>
       </header>
 
-      <div className="row">
-        <section className="col">
-          <h2>1. Image &amp; mask</h2>
-          <ImageUploader onImage={handleImage} />
-          {image ? (
-            <MaskCanvas image={image.el} paths={paths} setPaths={setPaths} />
-          ) : (
-            <p className="empty-hint">No image loaded yet.</p>
-          )}
+      <main className="main-content">
+        <section className="step">
+          <div className="step-header">
+            <span className="step-number">1</span>
+            <h2>Upload & Mask</h2>
+          </div>
+          <div className="step-content">
+            <ImageUploader onImage={handleImage} />
+            {image ? (
+              <div className="canvas-container">
+                <MaskCanvas image={image.el} paths={paths} setPaths={setPaths} />
+              </div>
+            ) : (
+              <div className="empty-state">
+                <p>No image loaded yet. Upload a photo to start.</p>
+              </div>
+            )}
+          </div>
         </section>
 
-        <section className="col">
-          <h2>2. Models</h2>
-          <ModelSelector selected={models} onChange={setModels} />
-          <button
-            className="run-btn"
-            onClick={handleRun}
-            disabled={!image || paths.length === 0 || submitting || !models.length}
-          >
-            {submitting ? 'Submitting…' : 'Run'}
-          </button>
-          {error && <p className="error">{error}</p>}
-          {job && (
-            <p className="job-status">
-              Job <code>{job.job_id}</code> — <strong>{job.status}</strong>
-            </p>
-          )}
-        </section>
-      </div>
+        <section className="step">
+          <div className="step-header">
+            <span className="step-number">2</span>
+            <h2>Choose Models</h2>
+          </div>
+          <div className="step-content">
+            <ModelSelector selected={models} onChange={setModels} />
 
-      {job && <ResultGallery job={job} />}
+            <div className="action-area">
+              <button
+                className="run-btn"
+                onClick={handleRun}
+                disabled={!image || paths.length === 0 || submitting || !models.length}
+              >
+                {submitting ? 'Starting...' : 'Run Inpainting'}
+              </button>
+              {error && <p className="error">{error}</p>}
+              git branch
+            </div>
+          </div>
+        </section>
+
+        {job && (
+          <section className="step results-step">
+            <div className="step-header">
+              <span className="step-number">3</span>
+              <h2>Results</h2>
+            </div>
+            <ResultGallery job={job} />
+          </section>
+        )}
+      </main>
     </div>
   )
 }

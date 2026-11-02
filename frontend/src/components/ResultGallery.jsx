@@ -13,7 +13,6 @@ export default function ResultGallery({ job }) {
 
   return (
     <section className="gallery-section">
-      <h2>3. Results</h2>
       <div className="carousel-wrap">
         <button className="carousel-btn" onClick={() => scrollBy(-1)} aria-label="Previous">‹</button>
         <div className="carousel" ref={scrollRef}>
