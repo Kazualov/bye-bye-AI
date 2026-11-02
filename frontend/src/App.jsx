@@ -62,7 +62,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="hero">
-        <h1>Object Removal <span className="accent">AI</span></h1>
+        <h1>Bye-bye <span className="accent">AI</span></h1>
         <p className="subtitle">
           Upload an image, draw a lasso around any object, and let our AI models remove it seamlessly.
         </p>
@@ -105,7 +105,6 @@ export default function App() {
                 {submitting ? 'Starting...' : 'Run Inpainting'}
               </button>
               {error && <p className="error">{error}</p>}
-              git branch
             </div>
           </div>
         </section>
