@@ -1,3 +1,4 @@
+import asyncio
 import io
 import threading
 import time
@@ -7,7 +8,8 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -17,19 +19,17 @@ STORAGE = Path("storage")
 STORAGE.mkdir(exist_ok=True)
 
 MODELS = [
-    {"id": "telea", "name": "OpenCV Telea", "type": "classical",   "available": True},
-    {"id": "lama",  "name": "LaMa",          "type": "cnn",         "available": True},
-    {"id": "vit",   "name": "ViTInpainter",  "type": "transformer", "available": True},
-    {"id": "flux",  "name": "FLUX.1-Fill",   "type": "diffusion",   "available": True},
+    {"id": "telea", "name": "OpenCV Telea", "type": "classical", "available": True},
+    {"id": "lama", "name": "LaMa", "type": "cnn", "available": True},
+    {"id": "vit", "name": "ViTInpainter", "type": "transformer", "available": True},
+    #{"id": "flux", "name": "FLUX.1-Fill", "type": "diffusion", "available": True},
 ]
 
-# Models to load in the background at server start (so the first user
-# request doesn't wait for the weights download).
 WARMUP_MODELS = ("lama",)
 
 _MODEL_CACHE = {}
-_LOAD_LOCK = threading.Lock()   # warmup and first request must not load a model twice
-_RUN_LOCK = threading.Lock()    # one GPU: inference runs one at a time
+_LOAD_LOCK = threading.Lock()
+_RUN_LOCK = threading.Lock()
 
 
 def get_model(mid: str):
@@ -45,9 +45,9 @@ def get_model(mid: str):
             elif mid == "lama":
                 from models.lama import LaMaInpainter
                 _MODEL_CACHE[mid] = LaMaInpainter()
-            elif mid == "flux":
-                from models.flux_fill import FluxFillInpainter
-                _MODEL_CACHE[mid] = FluxFillInpainter()
+            # elif mid == "flux":
+            #     from models.flux_fill import FluxFillInpainter
+            #     _MODEL_CACHE[mid] = FluxFillInpainter()
             else:
                 raise ValueError(f"Unknown model ID: {mid}")
         return _MODEL_CACHE[mid]
@@ -82,11 +82,38 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 log("model_load_failed", model=mid, error=str(e))
 
-    threading.Thread(target=warmup, daemon=True).start()   # server starts immediately
+    threading.Thread(target=warmup, daemon=True).start()
     yield
 
 
 app = FastAPI(title="Inpainting API", version=APP_VERSION, lifespan=lifespan)
+
+
+# --- WebSocket Manager ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, job_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.setdefault(job_id, []).append(websocket)
+
+    def disconnect(self, job_id: str, websocket: WebSocket):
+        if job_id in self.active_connections:
+            self.active_connections[job_id].remove(websocket)
+            if not self.active_connections[job_id]:
+                del self.active_connections[job_id]
+
+    async def broadcast(self, job_id: str, message: dict):
+        if job_id in self.active_connections:
+            for connection in self.active_connections[job_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    pass
+
+
+manager = ConnectionManager()
 
 
 @app.get("/api/v1/health")
@@ -99,37 +126,54 @@ def list_models():
     return {"models": MODELS}
 
 
-def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: List[str]) -> None:
+async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: List[str]) -> None:
     job = JOBS[job_id]
     job["status"] = "running"
+    await manager.broadcast(job_id, job)
 
-    img_arr = np.array(Image.open(image_path).convert("RGB"))
-    msk_arr = np.array(Image.open(mask_path).convert("L"))
+    try:
+        img_arr = np.array(Image.open(image_path).convert("RGB"))
+        msk_arr = np.array(Image.open(mask_path).convert("L"))
+    except Exception as e:
+        log("job_failed", job_id=job_id, error=f"Failed to load image/mask: {e}")
+        job["status"] = "failed"
+        await manager.broadcast(job_id, job)
+        return
 
     for mid in model_ids:
         entry = next(r for r in job["results"] if r["model"] == mid)
         entry["status"] = "running"
+        await manager.broadcast(job_id, job)
         log("model_start", job_id=job_id, model=mid)
 
-        t0 = time.time()
         try:
+            t0 = time.time()
             model = get_model(mid)
-            with _RUN_LOCK:
-                result = model.inpaint(img_arr, msk_arr)
+
+            def run_inference():
+                with _RUN_LOCK:
+                    return model.inpaint(img_arr, msk_arr)
+
+            result = await asyncio.to_thread(run_inference)
+
             out_name = f"{mid}.png"
             out_path = STORAGE / job_id / out_name
             Image.fromarray(result.image).save(out_path)
             entry["status"] = "succeeded"
             entry["output_url"] = f"/files/{job_id}/{out_name}"
+
             runtime_sec = getattr(result, "inference_time", time.time() - t0)
             entry["runtime_ms"] = int(runtime_sec * 1000)
             log("model_done", job_id=job_id, model=mid, runtime_ms=entry["runtime_ms"])
+
         except Exception as exc:
             _free_gpu()
             msg = str(exc) or type(exc).__name__
             entry["status"] = "failed"
             entry["error"] = msg
             log("model_failed", job_id=job_id, model=mid, error=msg)
+
+        await manager.broadcast(job_id, job)
 
     statuses = [r["status"] for r in job["results"]]
     if all(s == "succeeded" for s in statuses):
@@ -138,7 +182,9 @@ def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: List[st
         job["status"] = "failed"
     else:
         job["status"] = "partial"
+
     log("job_done", job_id=job_id, status=job["status"])
+    await manager.broadcast(job_id, job)
 
 
 @app.post("/api/v1/jobs", status_code=202)
@@ -192,8 +238,10 @@ async def create_job(
 
     image_path = job_dir / "input.png"
     mask_path = job_dir / "mask.png"
+
     img.convert("RGB").save(image_path)
-    msk_l.save(mask_path)
+    msk = msk_l.point(lambda p: 255 if p > 127 else 0)
+    msk.save(mask_path)
 
     JOBS[job_id] = {
         "job_id": job_id,
@@ -226,6 +274,21 @@ def get_job(job_id: str):
     return job
 
 
+@app.websocket("/api/v1/ws/jobs/{job_id}")
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    if job_id not in JOBS:
+        await websocket.close(code=1008)
+        return
+
+    await manager.connect(job_id, websocket)
+    try:
+        await websocket.send_json(JOBS[job_id])
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(job_id, websocket)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
     if isinstance(exc.detail, dict):
@@ -238,7 +301,7 @@ async def http_exception_handler(request, exc: HTTPException):
 # Serve generated files (input, mask, outputs)
 app.mount("/files", StaticFiles(directory=str(STORAGE)), name="files")
 
-# Serve the frontend if the folder exists (added later, not yet)
+# Serve the frontend if the folder exists
 FRONTEND_DIR = Path("frontend")
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

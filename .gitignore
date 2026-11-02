@@ -230,3 +230,8 @@ test_artifacts/
 # Project outputs
 results/
 data/corne-val/
+
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
