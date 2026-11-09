@@ -37,6 +37,7 @@ bye-bye-AI/
 │   └── visualization.py      # comparison grids, failure-case figures, plots
 ├── data/
 │   └── dataset.py            # downloads CORNE-Val and converts it to our layout
+├── benchmark_results/        # final benchmark numbers (CSVs + plots) used in the report
 ├── backend/                  # FastAPI server for the web app
 │   ├── app.py
 │   └── Dockerfile
@@ -124,6 +125,8 @@ Each model is evaluated on six mask experiments per sample:
 
 Metrics are computed against `bg` on the masked region (`*_region`, the main numbers) and on the full image (`*_full`).
 
+A full run of all three models takes several hours. On an Apple M5 (MPS) it took about 4 h 48 min, mostly spent computing metrics. To try it quickly, point `--dataset` at a folder that contains only a few sample directories.
+
 ### 3. Outputs
 
 ```
@@ -135,6 +138,10 @@ results/<ModelName>/
 ├── qualitative_best/    # comparison grid: shot | mask | GT | prediction
 └── plots/               # bar charts for sam_native
 ```
+
+### Final results
+
+The numbers used in the final report are committed in [`benchmark_results/`](benchmark_results/README.md), together with the exact commit, hardware and settings that produced them.
 
 ### Reproducibility
 
