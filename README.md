@@ -107,3 +107,68 @@ result = model.inpaint(image_rgb_uint8, mask_uint8)
 | Alexander | ViTInpainter (`models/vitinpainter.py`) |
 | Egor | FLUX.1-Fill (`models/flux_fill.py`) |
 | Tatiana | Frontend + Backend (`app/`) |
+
+---
+
+## 🚀 Quick Start
+
+There are two ways to run the project: using **Docker** (recommended, one command) or running the **Local Development** servers separately.
+
+### Option 1: Docker (One-Command Launch)
+
+This is the easiest way to run the entire stack (Frontend, Backend, and Models) on any operating system.
+
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) must be installed and running.
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/Kazualov/bye-bye-AI.git
+   cd bye-bye-AI
+   ```
+
+2. Make sure **Docker Desktop** is running in the background.
+
+3. Build and start the containers:
+   ```bash
+   docker compose up --build
+   ```
+   *(Note: The first build may take 5-10 minutes as Docker downloads base images and installs dependencies).*
+
+4. Open the application in your browser:
+   **http://localhost:5173**
+
+5. **To stop the application:**
+   Press `Ctrl + C` in the terminal, or run the following command in a new terminal tab:
+   ```bash
+   docker compose down
+   ```
+
+---
+
+### Option 2: Local Development (Separate Terminals)
+
+Use this method if you want to modify the code and see changes instantly (Hot Reload).
+
+**Prerequisites:** Python 3.12 and Node.js 20+ must be installed.
+
+#### Terminal 1: Backend
+```bash
+cd bye-bye-AI
+python3.12 -m venv .venv
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn backend.app:app --reload
+```
+
+#### Terminal 2: Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+**Access:**
+*   Frontend: **http://localhost:5173**
+*   Backend API: **http://127.0.0.1:8000**
+
+> ⚠️ **Important Note:** On the very first request, the backend will automatically download the neural network weights (LaMa and ViT models). This may take a few minutes depending on your internet speed. Please wait until the models are downloaded and inference completes.
