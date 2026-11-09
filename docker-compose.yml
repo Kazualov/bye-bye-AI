@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   backend:
     build:
@@ -9,7 +7,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # Job inputs/outputs produced by the web app
       - ./storage:/app/storage
+      # Model weights (LaMa -> ~/.cache/inpainting-bench, MAT/LPIPS -> HF / torch caches).
+      # Kept in a named volume so they are downloaded only once, not on every rebuild.
+      - model-cache:/root/.cache
     restart: unless-stopped
 
   frontend:
@@ -22,3 +24,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  model-cache:

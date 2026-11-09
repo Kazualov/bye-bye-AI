@@ -1,3 +1,14 @@
+"""
+FastAPI backend for the interactive web app (Application Mode).
+
+Flow: the frontend uploads an image + mask and a list of model IDs
+(POST /api/v1/jobs). A background task runs each model in turn, writes the
+outputs to storage/<job_id>/ and pushes job status updates over a WebSocket
+(/api/v1/ws/jobs/<job_id>). See docs/api_contract.md for the full API.
+
+Run locally:  uvicorn backend.app:app --reload
+"""
+
 import asyncio
 import io
 import threading
@@ -15,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 APP_VERSION = "0.1.0"
-STORAGE = Path("storage")
+STORAGE = Path("storage")  # per-job inputs/outputs, served under /files
 STORAGE.mkdir(exist_ok=True)
 
 MODELS = [
@@ -25,11 +36,12 @@ MODELS = [
     #{"id": "flux", "name": "FLUX.1-Fill", "type": "diffusion", "available": True},
 ]
 
+# Loaded in the background at startup so the first request is faster
 WARMUP_MODELS = ("lama",)
 
-_MODEL_CACHE = {}
-_LOAD_LOCK = threading.Lock()
-_RUN_LOCK = threading.Lock()
+_MODEL_CACHE = {}                # model ID -> loaded inpainter instance
+_LOAD_LOCK = threading.Lock()    # prevents loading the same model twice in parallel
+_RUN_LOCK = threading.Lock()     # runs one inference at a time to limit GPU/CPU memory
 
 
 def get_model(mid: str):
@@ -63,10 +75,11 @@ def _free_gpu() -> None:
         pass
 
 
-JOBS = {}
+JOBS = {}  # job_id -> job status dict (in memory; lost on restart)
 
 
 def log(event: str, **fields) -> None:
+    """Print a timestamped structured log line: `<ts> <event> key=value ...`."""
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     kv = " ".join(f"{k}={v}" for k, v in fields.items())
     print(f"[{ts}] {event} {kv}", flush=True)
@@ -74,6 +87,7 @@ def log(event: str, **fields) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Start a background thread that pre-loads WARMUP_MODELS."""
     def warmup():
         for mid in WARMUP_MODELS:
             try:
@@ -91,6 +105,8 @@ app = FastAPI(title="Inpainting API", version=APP_VERSION, lifespan=lifespan)
 
 # --- WebSocket Manager ---
 class ConnectionManager:
+    """Tracks open WebSockets per job and broadcasts job updates to them."""
+
     def __init__(self):
         self.active_connections: dict[str, list[WebSocket]] = {}
 
@@ -127,6 +143,11 @@ def list_models():
 
 
 async def _run_models(job_id: str, image_path: str, mask_path: str, model_ids: List[str]) -> None:
+    """Run every requested model on the job's image/mask, updating JOBS as it goes.
+
+    A failing model marks only its own result as failed; the job ends as
+    "succeeded", "failed" or "partial" depending on all results.
+    """
     job = JOBS[job_id]
     job["status"] = "running"
     await manager.broadcast(job_id, job)
@@ -194,6 +215,11 @@ async def create_job(
         mask: UploadFile = File(...),
         models: str = Form(...),
 ):
+    """Validate the upload, save it to storage/<job_id>/ and start the job.
+
+    `models` is a comma-separated list of model IDs, e.g. "telea,lama,vit".
+    Returns 202 with the job ID; progress is reported via GET or WebSocket.
+    """
     img_bytes = await image.read()
     mask_bytes = await mask.read()
 
@@ -268,6 +294,7 @@ async def create_job(
 
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(job_id: str):
+    """Return the current status and results of a job."""
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, detail={"error": "job_not_found", "message": job_id})
@@ -276,6 +303,7 @@ def get_job(job_id: str):
 
 @app.websocket("/api/v1/ws/jobs/{job_id}")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    """Send the job state immediately, then every update until the client disconnects."""
     if job_id not in JOBS:
         await websocket.close(code=1008)
         return
@@ -301,7 +329,10 @@ async def http_exception_handler(request, exc: HTTPException):
 # Serve generated files (input, mask, outputs)
 app.mount("/files", StaticFiles(directory=str(STORAGE)), name="files")
 
-# Serve the frontend if the folder exists
-FRONTEND_DIR = Path("frontend")
+# Serve the production frontend build if it exists (`cd frontend && npm run build`).
+# In development the Vite dev server on :5173 serves the frontend instead, and in
+# Docker nginx does. The raw frontend/ folder can't be served directly: it is
+# un-compiled React source.
+FRONTEND_DIR = Path("frontend") / "dist"
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

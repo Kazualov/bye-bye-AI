@@ -44,7 +44,7 @@ def test_models():
     assert "vit" in model_ids
     assert "lama" in model_ids
     assert "telea" in model_ids
-    assert "flux" in model_ids
+    assert "flux" not in model_ids  # FLUX.1-Fill is out of scope
     print("✓ test_models passed")
 
 def test_validation():
@@ -115,10 +115,19 @@ def test_multi_model_execution():
     img_bytes, _ = make_test_png(128, 128)
     msk_bytes, _ = make_test_mask(128, 128)
 
+    # "flux" is no longer a valid model ID, so requesting it is rejected up front
     res = client.post(
         "/api/v1/jobs",
         files={"image": ("input.png", img_bytes, "image/png"), "mask": ("mask.png", msk_bytes, "image/png")},
         data={"models": "telea,vit,flux"},
+    )
+    assert res.status_code == 400
+    assert res.json()["error"] == "invalid_model"
+
+    res = client.post(
+        "/api/v1/jobs",
+        files={"image": ("input.png", img_bytes, "image/png"), "mask": ("mask.png", msk_bytes, "image/png")},
+        data={"models": "telea,vit"},
     )
     assert res.status_code == 202
     job_id = res.json()["job_id"]
@@ -126,18 +135,13 @@ def test_multi_model_execution():
     res = client.get(f"/api/v1/jobs/{job_id}")
     assert res.status_code == 200
     job = res.json()
-    # telea and vit succeeded, flux failed (not implemented) -> overall job is partial
-    assert job["status"] == "partial"
-    
+    assert job["status"] == "succeeded"
+
     telea_res = next(r for r in job["results"] if r["model"] == "telea")
     vit_res = next(r for r in job["results"] if r["model"] == "vit")
-    flux_res = next(r for r in job["results"] if r["model"] == "flux")
-
     assert telea_res["status"] == "succeeded"
     assert vit_res["status"] == "succeeded"
-    assert flux_res["status"] == "failed"
-    assert "not yet implemented" in flux_res["error"]
-    print("✓ test_multi_model_execution passed (telea + vit succeeded, flux failed gracefully)")
+    print("✓ test_multi_model_execution passed (telea + vit succeeded)")
 
 if __name__ == "__main__":
     print("--- Running Backend Integration Tests ---")

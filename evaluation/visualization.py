@@ -1,10 +1,11 @@
 """
 Visualisation utilities: comparison grids and metric bar-charts.
 
-Outputs land in:
-    results/qualitative_comparison/
-    results/failure_cases/
-    results/plots/
+Used by evaluation/benchmark.py and scripts/. Outputs land under the
+per-model results folder, e.g.:
+    results/<ModelName>/qualitative_best/   comparison grids
+    results/<ModelName>/failure_cases/      annotated failure figures
+    results/<ModelName>/plots/              metric bar charts
 """
 
 from pathlib import Path

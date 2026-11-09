@@ -29,8 +29,21 @@ import urllib
 import urllib.request
 import uuid
 
-from distutils.util import strtobool
 from typing import Any, List, Tuple, Union
+
+
+def strtobool(val: str) -> bool:
+    """Replacement for distutils.util.strtobool.
+
+    `distutils` was removed from the standard library in Python 3.12, so the
+    original MAT import only worked when setuptools happened to be installed.
+    """
+    val = val.lower()
+    if val in ("y", "yes", "t", "true", "on", "1"):
+        return True
+    if val in ("n", "no", "f", "false", "off", "0"):
+        return False
+    raise ValueError(f"invalid truth value {val!r}")
 
 
 # Util classes
