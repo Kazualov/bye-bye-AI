@@ -12,14 +12,20 @@ Usage
 
 The script loads every sample in the CORNE-Val dataset, runs each requested
 model under every mask variant, computes PSNR / SSIM / LPIPS / inference-time
-on the masked region, and writes per-model output directories:
+on the masked region and on the full image, and writes per-model output
+directories:
 
     results/
     └── <ModelName>/
-        ├── metrics.csv              per-sample, per-mask rows
-        ├── summary.csv              mean ± std aggregated by mask
-        ├── qualitative_comparison/  side-by-side PNG per sample
-        └── plots/                   bar charts per metric
+        ├── metrics.csv              one row per (sample, mask experiment)
+        ├── summary.csv              mean and std of every metric per mask experiment
+        ├── best_per_sample.csv      best mask experiment for each sample (by BEST_METRIC)
+        ├── mask_ranking.csv         mask experiments ranked by mean BEST_METRIC + win count
+        ├── qualitative_best/        comparison grid of the best mask experiment per sample
+        └── plots/                   bar charts of the sam_native metrics
+
+All models are deterministic (ViTInpainter uses a fixed latent seed), so
+re-running the benchmark on the same hardware reproduces the same numbers.
 
 CORNE-Val directory layout expected
 -------------------------------------
@@ -121,8 +127,10 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         If provided, only models whose names appear in this list are loaded
         (matched case-insensitively). If None, all available models are loaded.
 
-    Models that are not yet implemented (ViTInpainter, FluxFill) are silently
-    skipped so the benchmark runs with whatever is ready.
+    Models that fail to load (e.g. weights cannot be downloaded) are skipped
+    with a message, so the benchmark runs with whatever is available.
+    FLUX.1-Fill is out of scope and always raises NotImplementedError, so it
+    is skipped silently.
     """
     models = {}
 
@@ -135,7 +143,6 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         except Exception as e:
             print(f"  [skip] LaMa could not be loaded: {e}")
 
-    # Alexander's model — add when implemented
     if _want("ViTInpainter", model_filter):
         try:
             from models.vitinpainter import ViTInpainter
@@ -145,7 +152,7 @@ def build_models(model_filter: list[str] | None = None) -> dict:
         except Exception as e:
             print(f"  [skip] ViTInpainter: {e}")
 
-    # Egor's model — add when implemented
+    # Out of scope for the final project; kept so the interface stays complete
     if _want("FLUX.1-Fill", model_filter):
         try:
             from models.flux_fill import FluxFillInpainter
@@ -160,8 +167,11 @@ def build_models(model_filter: list[str] | None = None) -> dict:
 
 # ── mask experiment plan ───────────────────────────────────────────────────────
 
-# Each entry: (mask_experiment_name, base_mask_key, MaskType, dilation_radius)
+# Metric used to pick the "best" mask experiment per sample:
+# (MetricsResult attribute, higher_is_better). LPIPS: lower is better.
 BEST_METRIC = ("lpips_full", False)
+
+# Each entry: (mask_experiment_name, base_mask_key, MaskType, dilation_radius)
 MASK_EXPERIMENTS = [
     ("sam_native",   "mask_sam", MaskType.NATIVE,   0),
     ("sam_dilated10","mask_sam", MaskType.DILATED,  10),
@@ -201,14 +211,14 @@ def run_benchmark(
         model_dir = output_path / model_name
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        rows = []        # (sample, mask_experiment)
-        best_rows = []   # победитель на каждый sample
+        rows = []        # one row per (sample, mask_experiment)
+        best_rows = []   # winning mask experiment for each sample
 
         for sample in tqdm(samples, desc=model_name):
             sample_id = sample["id"]
             shot = sample["shot"]
             gt = sample["bg"]
-            best = None  # (score, exp_name, mask, pred)
+            best = None  # (score, exp_name, mask, pred) of the best experiment so far
 
             for exp_name, mask_key, mask_type, dil_radius in MASK_EXPERIMENTS:
                 mask = MaskFactory.make(sample[mask_key], mask_type, dil_radius)
@@ -241,13 +251,13 @@ def run_benchmark(
                 if best is None or (score > best[0] if higher_is_better else score < best[0]):
                     best = (score, exp_name, mask, result.image)
 
-            # одна лучшая картинка на сэмпл
+            # save one comparison grid per sample: the best mask experiment
             if best is not None:
                 score, exp_name, mask, pred = best
                 save_comparison_grid(
                     sample_id=f"{sample_id}__{exp_name}",
                     shot=shot,
-                    mask=mask,                      # реально использованная маска
+                    mask=mask,                      # the mask actually used for this experiment
                     ground_truth=gt,
                     predictions={model_name: pred},
                     output_dir=model_dir / "qualitative_best",
@@ -263,7 +273,7 @@ def run_benchmark(
         df.to_csv(model_dir / "metrics.csv", index=False)
         print(f"\n[{model_name}] Saved metrics.csv  ({len(df)} rows)")
 
-        # ── summary по маскам ──────────────────────────────────────────────────
+        # ── summary per mask experiment (mean ± std) ───────────────────────────
         summary_df = (
             df.groupby("mask_experiment")[metric_cols]
             .agg(["mean", "std"])
@@ -271,7 +281,7 @@ def run_benchmark(
         )
         summary_df.to_csv(model_dir / "summary.csv")
 
-        # ── какая маска лучше справилась ───────────────────────────────────────
+        # ── which mask experiment worked best ──────────────────────────────────
         best_df = pd.DataFrame(best_rows)
         best_df.to_csv(model_dir / "best_per_sample.csv", index=False)
 
@@ -285,17 +295,17 @@ def run_benchmark(
         )
         ranking.to_csv(model_dir / "mask_ranking.csv")
 
-        print(f"\n[{model_name}] Ranking масок по {metric_name}:")
+        print(f"\n[{model_name}] Mask ranking by {metric_name}:")
         print(ranking.to_string())
-        print(f"[{model_name}] Лучшая маска: {ranking.index[0]}")
+        print(f"[{model_name}] Best mask: {ranking.index[0]}")
 
-        # ── plots (как раньше, по sam_native) ──────────────────────────────────
+        # ── plots (native object-core mask only) ───────────────────────────────
         sam_native = df[df["mask_experiment"] == "sam_native"]
         save_metric_plots({model_name: sam_native[metric_cols].mean().to_dict()}, model_dir / "plots")
 
         print(f"[{model_name}] All results written to {model_dir}")
 
-    print(f"\nDone. Output root:{output_path}")
+    print(f"\nDone. Output root: {output_path}")
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────

@@ -1,13 +1,13 @@
 import sys
 import os
 
-# Add the project root to sys.path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add the project root to sys.path (this file lives in tests/)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.vitinpainter import ViTInpainter
 import numpy as np
 
-def main():
+def test_vitinpainter():
     print("Initializing ViTInpainter...")
     inpainter = ViTInpainter()
     
@@ -53,7 +53,14 @@ def main():
     mask_diff = np.abs(result.image[mask > 0].astype(int) - image[mask > 0].astype(int))
     assert mask_diff.max() > 0, "Inpainted region is an exact copy of the input image!"
     print(f"Masked region mean absolute pixel change: {mask_diff.mean():.2f}")
+    # Default seed makes the output deterministic: two calls give identical images
+    np.testing.assert_array_equal(
+        inpainter.inpaint(image, mask).image,
+        result.image,
+        err_msg="ViTInpainter output changed between two calls with the default seed!",
+    )
+
     print("All assertions passed successfully!")
 
 if __name__ == "__main__":
-    main()
+    test_vitinpainter()
